@@ -22,6 +22,7 @@ import subprocess
 import sys
 import textwrap
 import traceback
+import pipes
 from copy import deepcopy
 from distutils.errors import CompileError, DistutilsError, \
     DistutilsPlatformError, LinkError
@@ -598,20 +599,26 @@ def get_common_options(build_ext):
                 'third_party/flatbuffers/include',
                 'third_party/lbfgs/include']
     SOURCES = ['horovod/common/common.cc',
+               'horovod/common/controller.cc',
                'horovod/common/fusion_buffer_manager.cc',
                'horovod/common/half.cc',
+               'horovod/common/logging.cc',
                'horovod/common/message.cc',
                'horovod/common/mpi_context.cc',
+               'horovod/common/mpi_controller.cc',
                'horovod/common/operations.cc',
                'horovod/common/parameter_manager.cc',
                'horovod/common/response_cache.cc',
+               'horovod/common/stall_inspector.cc',
                'horovod/common/timeline.cc',
+               'horovod/common/tensor_queue.cc',
                'horovod/common/ops/collective_operations.cc',
                'horovod/common/ops/mpi_operations.cc',
                'horovod/common/ops/operation_manager.cc',
                'horovod/common/optim/bayesian_optimization.cc',
                'horovod/common/optim/gaussian_process.cc',
-               'horovod/common/logging.cc']
+               'horovod/common/utils/env_parser.cc'
+               ]
     COMPILE_FLAGS = cpp_flags + shlex.split(mpi_flags)
     LINK_FLAGS = link_flags + shlex.split(mpi_flags)
     LIBRARY_DIRS = []
@@ -665,7 +672,8 @@ def get_common_options(build_ext):
     if have_ddl:
         MACROS += [('HAVE_DDL', '1')]
         INCLUDES += ddl_include_dirs
-        SOURCES += ['horovod/common/ops/ddl_operations.cc']
+        SOURCES += ['horovod/common/ops/ddl_operations.cc',
+                    'horovod/common/ddl_mpi_context_manager.cc']
         LIBRARY_DIRS += ddl_lib_dirs
         LIBRARIES += ['ddl', 'ddl_pack']
 
@@ -754,9 +762,12 @@ def remove_offensive_gcc_compiler_options(compiler_version):
         ldshared = get_config_var('LDSHARED')
 
         for k, v in offensive_replacements.items():
-            cflags = cflags.replace(k, v)
-            cppflags = cppflags.replace(k, v)
-            ldshared = ldshared.replace(k, v)
+            if cflags:
+                cflags = cflags.replace(k, v)
+            if cppflags:
+                cppflags = cppflags.replace(k, v)
+            if ldshared:
+                ldshared = ldshared.replace(k, v)
 
         return cflags, cppflags, ldshared
 
@@ -764,10 +775,26 @@ def remove_offensive_gcc_compiler_options(compiler_version):
     return None, None, None
 
 
-def build_tf_extension(build_ext, options):
+# Filter out all the compiler macros (starts with -D)
+# that need to be passed to compiler
+def filter_compile_macros(compile_flags):
+    res = []
+    for flag in compile_flags:
+        if flag.startswith('-D'):
+            res.append(flag)
+    return res
+
+
+def build_tf_extension(build_ext, global_options):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+
     check_tf_version()
     tf_compile_flags, tf_link_flags = get_tf_flags(
         build_ext, options['COMPILE_FLAGS'])
+
+    gloo_compile_macros = filter_compile_macros(tf_compile_flags)
 
     tensorflow_mpi_lib.define_macros = options['MACROS']
     tensorflow_mpi_lib.include_dirs = options['INCLUDES']
@@ -780,7 +807,7 @@ def build_tf_extension(build_ext, options):
     tensorflow_mpi_lib.library_dirs = options['LIBRARY_DIRS']
     tensorflow_mpi_lib.libraries = options['LIBRARIES']
 
-    cc_compiler = cxx_compiler = cflags = cppflags = None
+    cc_compiler = cxx_compiler = cflags = cppflags = ldshared = None
     if sys.platform.startswith('linux') and not os.getenv('CC') and not os.getenv('CXX'):
         # Determine g++ version compatible with this TensorFlow installation
         import tensorflow as tf
@@ -829,7 +856,7 @@ def build_tf_extension(build_ext, options):
         with env(CC=cc_compiler, CXX=cxx_compiler, CFLAGS=cflags, CPPFLAGS=cppflags,
                  LDSHARED=ldshared):
             if options['BUILD_GLOO']:
-                build_cmake(build_ext, gloo_lib, 'tf', tensorflow_mpi_lib)
+                build_cmake(build_ext, gloo_lib, 'tf', gloo_compile_macros, tensorflow_mpi_lib)
             customize_compiler(build_ext.compiler)
             build_ext.build_extension(tensorflow_mpi_lib)
     finally:
@@ -910,7 +937,7 @@ def build_mx_extension(build_ext, global_options):
 
     # First build gloo
     if options['BUILD_GLOO']:
-        build_cmake(build_ext, gloo_lib, 'mxnet', options=options)
+        build_cmake(build_ext, gloo_lib, 'mxnet', [], options=options)
 
     check_mx_version()
     mx_compile_flags, mx_link_flags = get_mx_flags(
@@ -1061,7 +1088,7 @@ def build_torch_extension(build_ext, global_options, torch_version):
 
     # Build gloo
     if options['BUILD_GLOO']:
-        build_cmake(build_ext, gloo_lib, 'torch', options=options)
+        build_cmake(build_ext, gloo_lib, 'torch', [], options=options)
 
     # Update HAVE_CUDA to mean that PyTorch supports CUDA. Internally, we will be checking
     # HOROVOD_GPU_(ALLREDUCE|ALLGATHER|BROADCAST) to decide whether we should use GPU
@@ -1118,7 +1145,11 @@ def build_torch_extension(build_ext, global_options, torch_version):
         build_ext.build_extension(setuptools_ext)
 
 
-def build_torch_extension_v2(build_ext, options, torch_version):
+def build_torch_extension_v2(build_ext, global_options, torch_version):
+    # Backup the options, preventing other plugins access libs that
+    # compiled with compiler of this plugin
+    options = deepcopy(global_options)
+
     have_cuda = is_torch_cuda_v2(build_ext, include_dirs=options['INCLUDES'],
                                  extra_compile_args=options['COMPILE_FLAGS'])
     if not have_cuda and check_macro(options['MACROS'], 'HAVE_CUDA'):
@@ -1141,6 +1172,8 @@ def build_torch_extension_v2(build_ext, options, torch_version):
     import torch
     updated_macros = set_macro(updated_macros, '_GLIBCXX_USE_CXX11_ABI',
                                str(int(torch.compiled_with_cxx11_abi())))
+
+    gloo_abi_flag = ['-D_GLIBCXX_USE_CXX11_ABI=' + str(int(torch.compiled_with_cxx11_abi()))]
 
     # PyTorch requires -DTORCH_API_INCLUDE_EXTENSION_H
     updated_macros = set_macro(
@@ -1170,7 +1203,7 @@ def build_torch_extension_v2(build_ext, options, torch_version):
     for k, v in ext.__dict__.items():
         torch_mpi_lib_v2.__dict__[k] = v
 
-    cc_compiler = cxx_compiler = cflags = cppflags = None
+    cc_compiler = cxx_compiler = cflags = cppflags = ldshared = None
     if sys.platform.startswith('linux') and not os.getenv('CC') and not os.getenv('CXX'):
         from torch.utils.cpp_extension import check_compiler_abi_compatibility
 
@@ -1204,7 +1237,7 @@ def build_torch_extension_v2(build_ext, options, torch_version):
         with env(CC=cc_compiler, CXX=cxx_compiler, CFLAGS=cflags, CPPFLAGS=cppflags,
                  LDSHARED=ldshared):
             if options['BUILD_GLOO']:
-                build_cmake(build_ext, gloo_lib, 'torchv2', ext)
+                build_cmake(build_ext, gloo_lib, 'torchv2', gloo_abi_flag, torch_mpi_lib_v2)
             customize_compiler(build_ext.compiler)
             build_ext.build_extension(torch_mpi_lib_v2)
     finally:
@@ -1212,7 +1245,7 @@ def build_torch_extension_v2(build_ext, options, torch_version):
         customize_compiler(build_ext.compiler)
 
 
-def build_cmake(build_ext, ext, prefix, plugin_ext=None, options=None):
+def build_cmake(build_ext, ext, prefix, additional_flags, plugin_ext=None, options=None):
     cmake_bin = 'cmake'
 
     # All statically linked libraries will be placed here
@@ -1229,20 +1262,27 @@ def build_cmake(build_ext, ext, prefix, plugin_ext=None, options=None):
     extdir = os.path.abspath(
         os.path.dirname(build_ext.get_ext_fullpath(ext.name)))
     config = 'Debug' if build_ext.debug else 'Release'
-    cmake_args = [
-        '-DUSE_MPI=ON',
-        '-DCMAKE_BUILD_TYPE=' + config,
-        '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(config.upper(), extdir),
-        '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_{}={}'.format(config.upper(),
-                                                        lib_output_dir),
-    ]
+
+    # Pass additional compiler flags by setting CMAKE_CXX_FLAGS_[DEBUG/RELEASE]
+    # so that cmake will append these flags to CMAKE_CXX_FLAGS
+    additional_cxx_flags = pipes.quote(' '.join(additional_flags))
+    cmake_cxx_flag = '-DCMAKE_CXX_FLAGS_{type}:STRING={flags}'.format(
+        type=config.upper(), flags=additional_cxx_flags)
+    cmake_args = ['-DUSE_MPI=ON',
+                  '-DCMAKE_BUILD_TYPE=' + config,
+                  cmake_cxx_flag,
+                  '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{}={}'.format(config.upper(), extdir),
+                  '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_{}={}'.format(config.upper(),
+                                                                  lib_output_dir),
+                  ]
+
     cmake_build_args = [
         '--config', config,
         '--', '-j4',
     ]
 
     # Keep temp build files within a unique subdirectory
-    build_temp = os.path.abspath(os.path.join(build_ext.build_temp, ext.name))
+    build_temp = os.path.abspath(os.path.join(build_ext.build_temp, ext.name, prefix))
     if not os.path.exists(build_temp):
         os.makedirs(build_temp)
 
@@ -1333,6 +1373,7 @@ class custom_build_ext(build_ext):
         if not any(built_plugins):
             raise DistutilsError(
                 'None of TensorFlow, PyTorch, or MXNet plugins were built. See errors above.')
+
 
 require_list = ['cloudpickle', 'psutil', 'six']
 

@@ -17,23 +17,23 @@ tests=( \
        test-cpu-openmpi-py2_7-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
        test-cpu-openmpi-py3_5-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
        test-cpu-openmpi-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-cpu-openmpi-py2_7-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-cpu-openmpi-py3_5-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-cpu-openmpi-py3_6-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
+       test-cpu-openmpi-py2_7-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
+       test-cpu-openmpi-py3_5-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
+       test-cpu-openmpi-py3_6-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
        test-cpu-openmpi-py2_7-tfhead-kerashead-torchhead-mxnethead-pyspark2_4_0 \
        test-cpu-openmpi-py3_6-tfhead-kerashead-torchhead-mxnethead-pyspark2_4_0 \
-       test-cpu-mpich-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-cpu-mlsl-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
+       test-cpu-mpich-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
+       test-cpu-mlsl-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
        test-gpu-openmpi-py2_7-tf1_6_0-keras2_1_2-torch0_4_1-mxnet1_4_1-pyspark2_3_2 \
        test-gpu-openmpi-py3_5-tf1_6_0-keras2_1_2-torch0_4_1-mxnet1_4_1-pyspark2_3_2 \
        test-gpu-openmpi-py2_7-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
        test-gpu-openmpi-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-gpu-openmpi-py2_7-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-gpu-openmpi-py3_6-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
+       test-gpu-openmpi-py2_7-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
+       test-gpu-openmpi-py3_6-tf2_0_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
        test-gpu-openmpi-py2_7-tfhead-kerashead-torchhead-mxnethead-pyspark2_4_0 \
        test-gpu-openmpi-py3_6-tfhead-kerashead-torchhead-mxnethead-pyspark2_4_0 \
-       test-gpu-mpich-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
-       test-mixed-openmpi-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_4_1-pyspark2_4_0 \
+       test-gpu-mpich-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
+       test-mixed-openmpi-py3_6-tf1_14_0-keras2_2_4-torch1_1_0-mxnet1_5_0-pyspark2_4_0 \
 )
 
 build_test() {
@@ -146,6 +146,10 @@ run_all() {
       run_test "${test}" "${queue}" \
         ":muscle: Test Horovodrun (${test})" \
         "horovodrun -np 2 -H localhost:2 python /horovod/examples/tensorflow_mnist.py"
+      run_test "${test}" "${queue}" \
+        ":muscle: Test Horovodrun (${test})" \
+        "echo 'localhost slots=2' > hostfile" \
+        "horovodrun -np 2 -hostfile hostfile python /horovod/examples/mxnet_mnist.py"
     fi
   fi
 
