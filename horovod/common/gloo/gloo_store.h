@@ -13,28 +13,22 @@
 // limitations under the License.
 // ============================================================================
 
-#include "gloo_context.h"
-#include "gloo/mpi/context.h"
-#include "gloo/transport/tcp/device.h"
+#ifndef HOROVOD_GLOO_STORE_H
+#define HOROVOD_GLOO_STORE_H
+
+#include "gloo/rendezvous/store.h"
 
 namespace horovod {
 namespace common {
 
-void GlooContext::InitializeFromMPI(const MPI_Comm& mpi_comm,
-                                    const char* gloo_iface) {
-  gloo::transport::tcp::attr attr;
-  // TODO(sihan): add interface load balancing after
-  //  https://github.com/facebookincubator/gloo/issues/183 is resolved
-  attr.iface = gloo_iface;
-  attr.ai_family = AF_UNSPEC;
-  auto dev = gloo::transport::tcp::CreateDevice(attr);
+class GlooStore : public gloo::rendezvous::Store {
+public:
+  virtual ~GlooStore()=default;
 
-  auto context = std::make_shared<gloo::mpi::Context>(mpi_comm);
-  context->connectFullMesh(dev);
-  ctx = context;
-}
-
-void GlooContext::Finalize() { ctx.reset(); }
+  virtual void Finalize() = 0;
+};
 
 } // namespace common
 } // namespace horovod
+
+#endif //HOROVOD_GLOO_STORE_H

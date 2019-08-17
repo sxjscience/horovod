@@ -14,15 +14,15 @@
 // limitations under the License.
 // =============================================================================
 
+#include "mpi_context.h"
+
 #include <iostream>
 #include <memory>
 #include <vector>
 
-#include "common.h"
-#include "half.h"
-#include "logging.h"
-#include "mpi_context.h"
-#include "operations.h"
+#include "../common.h"
+#include "../half.h"
+#include "../logging.h"
 
 namespace horovod {
 namespace common {
@@ -87,6 +87,10 @@ int MPIContext::GetMPITypeSize(DataType dtype) {
 
 void MPIContext::Initialize(const std::vector<int>& ranks,
                             MPIContextManager& ctx_manager) {
+
+  if (!enabled_) {
+    return;
+  }
   // Initialize MPI if it was not initialized. This must happen on the
   // background thread, since not all MPI implementations support being called
   // from multiple threads.
@@ -162,6 +166,9 @@ void MPIContext::Initialize(const std::vector<int>& ranks,
 }
 
 void MPIContext::Finalize(MPIContextManager& ctx_manager) {
+  if (!enabled_) {
+    return;
+  }
   if (mpi_comm != MPI_COMM_NULL && mpi_comm != MPI_COMM_WORLD) {
     MPI_Comm_free(&mpi_comm);
   }

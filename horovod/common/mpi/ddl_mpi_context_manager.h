@@ -13,12 +13,12 @@
 // limitations under the License.
 // =============================================================================
 
-#ifndef HOROVOD_HOROVOD_COMMON_DDL_MPI_CONTEXT_MANAGER_H_
-#define HOROVOD_HOROVOD_COMMON_DDL_MPI_CONTEXT_MANAGER_H_
+#ifndef HOROVOD_DDL_MPI_CONTEXT_MANAGER_H
+#define HOROVOD_DDL_MPI_CONTEXT_MANAGER_H
 
 #include "mpi_context.h"
-#include "ops/cuda_operations.h"
-#include "ops/ddl_operations.h"
+#include "../ops/cuda_operations.h"
+#include "../ops/ddl_operations.h"
 
 namespace horovod {
 namespace common {
@@ -44,4 +44,4 @@ public:
 } // namespace common
 } // namespace horovod
 
-#endif // HOROVOD_HOROVOD_COMMON_DDL_MPI_CONTEXT_MANAGER_H_
+#endif // HOROVOD_DDL_MPI_CONTEXT_MANAGER_H
