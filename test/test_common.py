@@ -43,13 +43,12 @@ class CommonTests(unittest.TestCase):
         """Test that Gloo has been built if env is set."""
         gloo_rank = int(os.getenv('HOROVOD_RANK', -1))
         if gloo_rank >= 0:
-            self.assertEqual(gloo_built())
+            self.assertTrue(gloo_built())
 
     def test_tensorflow_available(self):
         """Test that TensorFLow support has been built."""
         available = extension_available('tensorflow')
         try:
-            import horovod.tensorflow
             self.assertTrue(available)
         except:
             self.assertFalse(available)
@@ -58,7 +57,6 @@ class CommonTests(unittest.TestCase):
         """Test that PyTorch support has been built."""
         available = extension_available('torch')
         try:
-            import horovod.torch
             self.assertTrue(available)
         except:
             self.assertFalse(available)
@@ -67,7 +65,6 @@ class CommonTests(unittest.TestCase):
         """Test that MXNet support has been built."""
         available = extension_available('mxnet')
         try:
-            import horovod.mxnet
             self.assertTrue(available)
         except:
             self.assertFalse(available)

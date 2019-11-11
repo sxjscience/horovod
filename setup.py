@@ -533,7 +533,8 @@ def get_common_options(build_ext):
         # determining if system has cmake installed
         compile_with_gloo = os.environ.get('HOROVOD_WITH_GLOO')
         try:
-            subprocess.check_output(['cmake', '--version'])
+            cmake_bin = get_cmake_bin()
+            subprocess.check_output([cmake_bin, '--version'])
             have_cmake = True
         except Exception:
             if compile_with_gloo:
@@ -798,7 +799,7 @@ def find_matching_gcc_compiler_path(gxx_compiler_version):
             # gcc, or gcc-7, gcc-4.9, or gcc-4.8.5
             compiler = os.path.join(path_dir, bin_file)
             compiler_version = determine_gcc_version(compiler)
-            if compiler_version == gxx_compiler_version:
+            if compiler_version and compiler_version == gxx_compiler_version:
                 return compiler
 
     print('INFO: Unable to find gcc compiler (version %s).' % gxx_compiler_version)
@@ -1304,8 +1305,12 @@ def build_torch_extension_v2(build_ext, global_options, torch_version):
         customize_compiler(build_ext.compiler)
 
 
+def get_cmake_bin():
+    return os.environ.get('HOROVOD_CMAKE', 'cmake')
+
+
 def build_cmake(build_ext, ext, prefix, additional_flags, options, plugin_ext=None):
-    cmake_bin = 'cmake'
+    cmake_bin = get_cmake_bin()
 
     # All statically linked libraries will be placed here
     lib_output_dir = os.path.abspath(os.path.join(build_ext.build_temp, 'lib', prefix))
@@ -1418,7 +1423,7 @@ class custom_build_ext(build_ext):
                 'None of TensorFlow, PyTorch, or MXNet plugins were built. See errors above.')
 
 
-require_list = ['cloudpickle', 'psutil', 'six']
+require_list = ['cloudpickle', 'psutil', 'pyyaml', 'six']
 
 # Skip cffi if pytorch extension explicitly disabled
 if not os.environ.get('HOROVOD_WITHOUT_PYTORCH'):

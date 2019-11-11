@@ -63,6 +63,10 @@ namespace common {
 #define HOROVOD_TIMELINE_MARK_CYCLES "HOROVOD_TIMELINE_MARK_CYCLES"
 #define HOROVOD_AUTOTUNE "HOROVOD_AUTOTUNE"
 #define HOROVOD_AUTOTUNE_LOG "HOROVOD_AUTOTUNE_LOG"
+#define HOROVOD_AUTOTUNE_WARMUP_SAMPLES "HOROVOD_AUTOTUNE_WARMUP_SAMPLES"
+#define HOROVOD_AUTOTUNE_STEPS_PER_SAMPLE "HOROVOD_AUTOTUNE_STEPS_PER_SAMPLE"
+#define HOROVOD_AUTOTUNE_BAYES_OPT_MAX_SAMPLES "HOROVOD_AUTOTUNE_BAYES_OPT_MAX_SAMPLES"
+#define HOROVOD_AUTOTUNE_GAUSSIAN_PROCESS_NOISE "HOROVOD_AUTOTUNE_GAUSSIAN_PROCESS_NOISE"
 #define HOROVOD_FUSION_THRESHOLD "HOROVOD_FUSION_THRESHOLD"
 #define HOROVOD_CYCLE_TIME "HOROVOD_CYCLE_TIME"
 #define HOROVOD_STALL_CHECK_DISABLE "HOROVOD_STALL_CHECK_DISABLE"
@@ -90,6 +94,9 @@ namespace common {
 
 // Device ID used for CPU.
 #define CPU_DEVICE_ID (-1)
+
+// Temporary tensor name for ranks that did Join().
+#define JOIN_TENSOR_NAME "join.noname"
 
 // List of supported frameworks.
 enum Framework { TENSORFLOW, PYTORCH, MXNET };
@@ -206,6 +213,8 @@ public:
   AllocatePersistent(int64_t size,
                      std::shared_ptr<PersistentBuffer>* tensor) = 0;
   virtual Status AllocateOutput(TensorShape shape,
+                                std::shared_ptr<Tensor>* tensor) = 0;
+  virtual Status AllocateZeros(int64_t num_elements, DataType dtype,
                                 std::shared_ptr<Tensor>* tensor) = 0;
   virtual Framework framework() const = 0;
   virtual ~OpContext() = default;

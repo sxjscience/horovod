@@ -16,13 +16,16 @@
 
 class Settings(object):
 
-    def __init__(self, verbose=0, ssh_port=None, key=None, timeout=None,
-                 num_hosts=None, num_proc=None, hosts=None, command=None):
+    def __init__(self, verbose=0, ssh_port=None, extra_mpi_args=None, key=None, timeout=None,
+                 num_hosts=None, num_proc=None, hosts=None, output_filename=None,
+                 run_func_mode=None, nic=None):
         """
         :param verbose: level of verbosity
         :type verbose: int
         :param ssh_port: SSH port on all the hosts
         :type ssh_port: int
+        :param extra_mpi_args: Extra MPI arguments to pass to mpirun
+        :type extra_mpi_args: string
         :param key: used for encryption of parameters passed across the hosts
         :type key: str
         :param timeout: has to finish all the checks before this timeout runs
@@ -34,14 +37,22 @@ class Settings(object):
         :type num_proc: int
         :param hosts: string of hostname with slots number
         :type hosts: string
-        :param command: number of horovod processes (-np)
-        :type num_proc: int
+        :param output_filename: optional filename to redirect stdout / stderr by process
+        :type output_filename: string
+        :param run_func_mode: whether it is run function mode
+        :type run_func_mode: boolean
+        :param nic: specify the NIC for tcp network communication.
+        :type nic: string
         """
         self.verbose = verbose
         self.ssh_port = ssh_port
+        self.extra_mpi_args = extra_mpi_args
         self.key = key
         self.timeout = timeout
         self.num_hosts = num_hosts
         self.num_proc = num_proc
         self.hosts = hosts
-        self.command = command
+        self.output_filename = output_filename
+        self.run_func_mode = run_func_mode
+        self.nic = nic
+

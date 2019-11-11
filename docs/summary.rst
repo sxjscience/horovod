@@ -323,6 +323,7 @@ to batch small *allreduce* operations, which results in improved performance. We
 
 See `here <tensor-fusion.rst>`__ for full details and tweaking instructions.
 
+
 Horovod Timeline
 ----------------
 Horovod has the ability to record the timeline of its activity, called Horovod Timeline.
@@ -332,6 +333,15 @@ Horovod has the ability to record the timeline of its activity, called Horovod T
 
 Use Horovod timeline to analyze Horovod performance.
 See `here <timeline.rst>`__ for full details and usage instructions.
+
+
+Automated Performance Tuning
+----------------------------
+Selecting the right values to efficiently make use of Tensor Fusion and other advanced Horovod features can involve
+a good amount of trial and error. We provide a system to automate this performance optimization process called
+**autotuning**, which you can enable with a single command line argument to ``horovodrun``.
+
+See `here <autotune.rst>`__ for full details and usage instructions.
 
 
 Guides
@@ -377,6 +387,11 @@ References
 The Horovod source code was based off the Baidu `tensorflow-allreduce <https://github.com/baidu-research/tensorflow-allreduce>`_
 repository written by Andrew Gibiansky and Joel Hestness. Their original work is described in the article
 `Bringing HPC Techniques to Deep Learning <http://andrew.gibiansky.com/blog/machine-learning/baidu-allreduce/>`_.
+
+Mailing lists
+-------------
+Subscribe to `Horovod Announce <https://lists.lfai.foundation/g/horovod-announce>`_ and 
+`Horovod Technical-Discuss <https://lists.lfai.foundation/g/horovod-technical-discuss>`_ to stay up to date.
 
 
 .. inclusion-marker-end-do-not-remove
