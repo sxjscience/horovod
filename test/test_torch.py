@@ -20,7 +20,6 @@ from __future__ import print_function
 
 from distutils.version import LooseVersion
 
-import collections
 import inspect
 import itertools
 import os
@@ -37,6 +36,11 @@ import torch.nn.functional as F
 import horovod.torch as hvd
 
 from common import mpi_env_rank_and_size
+
+try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
 
 _v2_api = LooseVersion(torch.__version__) >= LooseVersion('1.0.0')
 _fp16_supported = _v2_api
@@ -1111,7 +1115,7 @@ class TorchTests(unittest.TestCase):
             }
             for k, p in p0.items():
                 p_actual = optimizer.param_groups[0][k]
-                if not isinstance(p, collections.Iterable):
+                if not isinstance(p, Iterable):
                     p_actual = [p_actual]
                     p = [p]
                 for i in range(len(p)):
@@ -1144,14 +1148,17 @@ class TorchTests(unittest.TestCase):
 
         model = ModelNoGrad(a, b)
 
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001, weight_decay=1e-6, momentum=0.9, nesterov=True)
         optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
 
         hvd.broadcast_parameters(model.state_dict(), root_rank=0)
         hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
+        grad = optimizer.param_groups[0]['params'][1].grad
+        bgrad = hvd.broadcast(grad, root_rank=0)
+
         assert optimizer.param_groups[0]['params'][0].grad is None
-        assert torch.all(torch.eq(optimizer.param_groups[0]['params'][1].grad, torch.zeros([4]))).item()
+        assert torch.all(torch.eq(grad, bgrad)).item()
 
     def test_broadcast_object(self):
         hvd.init()
