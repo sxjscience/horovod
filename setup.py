@@ -1601,7 +1601,8 @@ setup(name='horovod',
       classifiers=[
           'License :: OSI Approved :: Apache Software License'
       ],
-      ext_modules=[torch_mpi_lib_v2, mxnet_mpi_lib], #[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl, torch_mpi_lib_v2, mxnet_mpi_lib, gloo_lib],
+      ext_modules=[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl,
+                   torch_mpi_lib_v2, mxnet_mpi_lib, gloo_lib],
       cmdclass={'build_ext': custom_build_ext},
       # cffi is required for PyTorch
       # If cffi is specified in setup_requires, it will need libffi to be installed on the machine,
