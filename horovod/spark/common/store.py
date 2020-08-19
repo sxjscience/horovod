@@ -13,15 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import contextlib
 import errno
 import os
 import re
 import shutil
 import tempfile
+
+from distutils.version import LooseVersion
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -184,6 +183,13 @@ class FilesystemStore(Store):
     def get_test_data_path(self, idx=None):
         return '{}.{}'.format(self._test_path, idx) if idx is not None else self._test_path
 
+    def get_data_metadata_path(self, path):
+        localized_path = self.get_localized_path(path)
+        if localized_path.endswith('/'):
+            localized_path = localized_path[:-1] # Remove the slash at the end if there is one
+        metadata_cache = localized_path+"_cached_metadata.pkl"
+        return metadata_cache
+
     def saving_runs(self):
         return self._save_runs
 
@@ -328,8 +334,9 @@ class HDFSStore(FilesystemStore):
                                  port=port,
                                  user=user,
                                  kerb_ticket=kerb_ticket,
-                                 driver=driver,
                                  extra_conf=extra_conf)
+        if LooseVersion(pa.__version__) < LooseVersion('0.17.0'):
+            self._hdfs_kwargs['driver'] = driver
         self._hdfs = self._get_filesystem_fn()()
 
         super(HDFSStore, self).__init__(prefix_path, *args, **kwargs)

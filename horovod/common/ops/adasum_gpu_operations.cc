@@ -91,6 +91,12 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
     num_elements += e.tensor->shape().num_elements();
   }
 
+  if (response.prescale_factor() != 1.0) {
+    // Execute prescaling op
+    ScaleBuffer(response.prescale_factor(), entries, fused_input_data, buffer_data, num_elements);
+    fused_input_data = buffer_data; // for unfused, scale is done out of place
+  }
+
   // Do allreduce.
   int element_size = mpi_context_->GetMPITypeSize(first_entry.tensor->dtype());
   int local_size = global_state_->controller->GetLocalSize();
@@ -159,7 +165,7 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
         (size_t)num_elements_per_rank, GetNCCLDataType(first_entry.tensor),
         ncclSum, *nccl_op_context_.nccl_comm_, *gpu_op_context_.stream);
 
-    nccl_context_->ErrorCheck("ncclReduceScatter", nccl_result);
+    nccl_context_->ErrorCheck("ncclReduceScatter", nccl_result, *nccl_op_context_.nccl_comm_);
     if (global_state_->timeline.Initialized()) {
       gpu_context_->RecordEvent(gpu_op_context_.event_queue,
                                  NCCL_REDUCESCATTER, *gpu_op_context_.stream);
@@ -174,7 +180,7 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
         (size_t)num_elements_remaining, GetNCCLDataType(first_entry.tensor),
         ncclSum, root_rank, *nccl_op_context_.nccl_comm_, *gpu_op_context_.stream);
 
-    nccl_context_->ErrorCheck("ncclReduce", nccl_result);
+    nccl_context_->ErrorCheck("ncclReduce", nccl_result, *nccl_op_context_.nccl_comm_);
     if (global_state_->timeline.Initialized()) {
       gpu_context_->RecordEvent(gpu_op_context_.event_queue, NCCL_REDUCE,
                                  *gpu_op_context_.stream);
@@ -267,7 +273,8 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
         "ncclAllGather", ncclAllGather(buffer_data_at_rank_offset, buffer_data,
                                        (size_t)num_elements_per_rank,
                                        GetNCCLDataType(first_entry.tensor),
-                                       *nccl_op_context_.nccl_comm_, *gpu_op_context_.stream));
+                                       *nccl_op_context_.nccl_comm_, *gpu_op_context_.stream),
+        *nccl_op_context_.nccl_comm_);
     if (global_state_->timeline.Initialized()) {
       gpu_context_->RecordEvent(gpu_op_context_.event_queue, NCCL_ALLGATHER,
                                 *gpu_op_context_.stream);
@@ -278,11 +285,17 @@ AdasumGpuAllreduceOp::NcclHierarchical(std::vector<TensorTableEntry>& entries,
         "ncclBcast",
         ncclBcast(buffer_data_remainder, (size_t)num_elements_remaining,
                   GetNCCLDataType(first_entry.tensor), root_rank, *nccl_op_context_.nccl_comm_,
-                  *gpu_op_context_.stream));
+                  *gpu_op_context_.stream),
+        *nccl_op_context_.nccl_comm_);
     if (global_state_->timeline.Initialized()) {
       gpu_context_->RecordEvent(gpu_op_context_.event_queue, NCCL_BCAST,
                                 *gpu_op_context_.stream);
     }
+  }
+
+  if (response.postscale_factor() != 1.0) {
+    // Execute postscaling op
+    ScaleBuffer(response.postscale_factor(), entries, buffer_data, buffer_data, num_elements);
   }
 
   // Copy memory out of the fusion buffer.

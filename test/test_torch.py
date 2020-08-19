@@ -1,5 +1,6 @@
 # Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
 # Modifications copyright (C) 2019 Intel Corporation
+# Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,10 +15,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from distutils.version import LooseVersion
 
 import inspect
@@ -26,6 +23,8 @@ import os
 import pytest
 import unittest
 import warnings
+
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -36,13 +35,7 @@ import horovod.torch as hvd
 
 from common import mpi_env_rank_and_size, temppath
 
-try:
-    from collections.abc import Iterable
-except ImportError:
-    from collections import Iterable
-
-_v2_api = LooseVersion(torch.__version__) >= LooseVersion('1.0.0')
-_fp16_supported = _v2_api
+_1_5_api = LooseVersion(torch.__version__) >= LooseVersion('1.5.0')
 
 ccl_supported_types = set([torch.CharTensor, torch.IntTensor,
                            torch.LongTensor, torch.FloatTensor, 
@@ -63,7 +56,7 @@ class TorchTests(unittest.TestCase):
         # In case we need to do ops, we will convert tensor to FP32 here.
         result = []
         for value in values:
-            if value.dtype in [torch.float16, torch.HalfTensor]:
+            if value.dtype in [torch.float16, torch.HalfTensor] and not value.is_cuda:
                 result.append(value.float())
             else:
                 result.append(value)
@@ -86,18 +79,33 @@ class TorchTests(unittest.TestCase):
 
         is_mpi = gloo_rank == -1
         if is_mpi:
-            # Only applies for Gloo
+            # Horovod cannot be re-initialized after shutdown when using MPI, so
+            # this test can only be done using the Gloo controller
             self.skipTest("Gloo is not available")
 
         hvd.init()
         rank, size = hvd.rank(), hvd.size()
-
         hvd.shutdown()
         hvd.init()
         rank2, size2 = hvd.rank(), hvd.size()
 
         assert rank == rank2
         assert size == size2
+
+    def test_horovod_is_initialized(self):
+        """Test that is_initialized returned by hvd.is_initialized() is correct."""
+        hvd.init()
+        assert hvd.is_initialized()
+
+        gloo_rank = int(os.getenv('HOROVOD_RANK', -1))
+        is_mpi = gloo_rank == -1
+        if is_mpi:
+            # Only applies for Gloo
+            self.skipTest("Gloo is not available")
+
+        hvd.shutdown()
+        assert not hvd.is_initialized()
+        hvd.init()
 
     def test_horovod_rank(self):
         """Test that the rank returned by hvd.rank() is correct."""
@@ -135,14 +143,11 @@ class TorchTests(unittest.TestCase):
         hvd.init()
         size = hvd.size()
         dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
-                     torch.FloatTensor, torch.DoubleTensor])
-        if _fp16_supported:
-            dtypes += self.filter_supported_types([torch.HalfTensor])
+                     torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
         if torch.cuda.is_available():
             dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             torch.manual_seed(1234)
@@ -151,7 +156,6 @@ class TorchTests(unittest.TestCase):
             summed = hvd.allreduce(tensor, average=False)
             tensor, summed = self.convert_cpu_fp16_to_fp32(tensor, summed)
             multiplied = tensor * size
-            max_difference = summed.data.sub(multiplied).max()
 
             # Threshold for floating point equality depends on number of
             # ranks, since we're comparing against precise multiplication.
@@ -165,7 +169,7 @@ class TorchTests(unittest.TestCase):
             else:
                 break
 
-            assert max_difference <= threshold, 'hvd.allreduce produces incorrect results'
+            assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
 
     def test_horovod_allreduce_average(self):
         """Test that the allreduce correctly averages 1D, 2D, 3D tensors."""
@@ -175,16 +179,14 @@ class TorchTests(unittest.TestCase):
                      torch.FloatTensor, torch.DoubleTensor])
         if torch.cuda.is_available():
             dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             torch.manual_seed(1234)
             tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
             tensor = self.cast_and_place(tensor, dtype)
             averaged = hvd.allreduce(tensor, average=True)
-            max_difference = averaged.data.sub(tensor).max()
 
             # Threshold for floating point equality depends on number of
             # ranks, since we're comparing against precise multiplication.
@@ -198,21 +200,18 @@ class TorchTests(unittest.TestCase):
             else:
                 break
 
-            assert max_difference <= threshold, 'hvd.allreduce produces incorrect results'
+            assert torch.allclose(averaged, tensor, threshold), 'hvd.allreduce produces incorrect results'
 
     def test_horovod_allreduce_inplace(self):
         """Test that the allreduce correctly sums 1D, 2D, 3D tensors."""
         hvd.init()
         size = hvd.size()
         dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
-                     torch.FloatTensor, torch.DoubleTensor])
-        if _fp16_supported:
-            dtypes += self.filter_supported_types([torch.HalfTensor])
+                     torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
         if torch.cuda.is_available():
             dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             torch.manual_seed(1234)
@@ -221,7 +220,6 @@ class TorchTests(unittest.TestCase):
             tensor = self.cast_and_place(tensor, dtype)
             hvd.allreduce_(tensor, average=False)
             tensor, multiplied = self.convert_cpu_fp16_to_fp32(tensor, multiplied)
-            max_difference = tensor.sub(multiplied).max()
 
             # Threshold for floating point equality depends on number of
             # ranks, since we're comparing against precise multiplication.
@@ -235,7 +233,7 @@ class TorchTests(unittest.TestCase):
             else:
                 break
 
-            assert max_difference <= threshold, 'hvd.allreduce produces incorrect results'
+            assert torch.allclose(tensor, multiplied, threshold), 'hvd.allreduce produces incorrect results'
 
     def test_horovod_allreduce_async_fused(self):
         """Test that the allreduce correctly sums 1D, 2D, 3D tensors
@@ -243,14 +241,11 @@ class TorchTests(unittest.TestCase):
         hvd.init()
         size = hvd.size()
         dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
-                  torch.FloatTensor, torch.DoubleTensor])
-        if _fp16_supported:
-            dtypes += self.filter_supported_types([torch.HalfTensor])
+                  torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
         if torch.cuda.is_available():
             dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         tests = []
         is_hvd_poll_false_once = False
@@ -271,7 +266,6 @@ class TorchTests(unittest.TestCase):
         for dtype, multiplied, handle in tests:
             summed = hvd.synchronize(handle)
             summed, = self.convert_cpu_fp16_to_fp32(summed)
-            max_difference = summed.sub(multiplied).max()
 
             # Threshold for floating point equality depends on number of
             # ranks, since we're comparing against precise multiplication.
@@ -285,7 +279,7 @@ class TorchTests(unittest.TestCase):
             else:
                 break
 
-            assert max_difference <= threshold, 'hvd.allreduce produces incorrect results'
+            assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
 
     def test_horovod_allreduce_multi_gpu(self):
         """Test that the allreduce works on multiple GPUs."""
@@ -303,9 +297,8 @@ class TorchTests(unittest.TestCase):
 
         iter = 0
         dtypes = [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                  torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.cuda.HalfTensor]
+                  torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                  torch.cuda.HalfTensor]
 
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
@@ -316,7 +309,6 @@ class TorchTests(unittest.TestCase):
             tensor = tensor.cuda(device).type(dtype)
             multiplied = tensor * size
             hvd.allreduce_(tensor, average=False)
-            max_difference = tensor.sub(multiplied).max()
 
             # Threshold for floating point equality depends on number of
             # ranks, since we're comparing against precise multiplication.
@@ -329,7 +321,115 @@ class TorchTests(unittest.TestCase):
             else:
                 break
 
-            assert max_difference <= threshold, 'hvd.allreduce produces incorrect results'
+            assert torch.allclose(tensor, multiplied, threshold), 'hvd.allreduce produces incorrect results'
+
+    def test_horovod_allreduce_prescale(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors with prescaling."""
+        hvd.init()
+        size = hvd.size()
+        dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
+                 torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        int_types = [torch.IntTensor, torch.LongTensor,
+                     torch.cuda.IntTensor, torch.cuda.LongTensor]
+        half_types = [torch.HalfTensor, torch.cuda.HalfTensor]
+
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            np.random.seed(1234)
+            factor = np.random.uniform()
+            tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            tensor = self.cast_and_place(tensor, dtype)
+            summed = hvd.allreduce(tensor, average=False,
+                                   prescale_factor=factor)
+
+            factor = torch.tensor(factor, dtype=torch.float64)
+            factor = factor.cuda(hvd.local_rank()) if dtype.is_cuda else factor
+            if dtype.is_cuda and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+              # For integer types, scaling done in FP64
+              factor = factor.type(torch.float64 if dtype in int_types else dtype)
+              tensor = tensor.type(torch.float64 if dtype in int_types else dtype)
+            else:
+              # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+              factor = factor.type(torch.float32 if dtype in half_types else
+                                   torch.float64 if dtype in int_types else dtype)
+              tensor = tensor.type(torch.float32 if dtype in half_types else
+                                   torch.float64 if dtype in int_types else dtype)
+            multiplied = factor * tensor
+            multiplied = multiplied.type(dtype)
+            summed, multiplied = self.convert_cpu_fp16_to_fp32(summed, multiplied)
+            multiplied *= size
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in int_types:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
+
+    def test_horovod_allreduce_postscale(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors with postscaling."""
+        hvd.init()
+        size = hvd.size()
+        dtypes = self.filter_supported_types([torch.IntTensor, torch.LongTensor,
+                 torch.FloatTensor, torch.DoubleTensor, torch.HalfTensor])
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        int_types = [torch.IntTensor, torch.LongTensor,
+                     torch.cuda.IntTensor, torch.cuda.LongTensor]
+        half_types = [torch.HalfTensor, torch.cuda.HalfTensor]
+
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            torch.manual_seed(1234)
+            np.random.seed(1234)
+            factor = np.random.uniform()
+            tensor = torch.FloatTensor(*([17] * dim)).random_(-100, 100)
+            tensor = self.cast_and_place(tensor, dtype)
+            summed = hvd.allreduce(tensor, average=False,
+                                   postscale_factor=factor)
+
+            factor = torch.tensor(factor, dtype=torch.float64)
+            factor = factor.cuda(hvd.local_rank()) if dtype.is_cuda else factor
+            if dtype.is_cuda and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+              # For integer types, scaling done in FP64
+              factor = factor.type(torch.float64 if dtype in int_types else dtype)
+              tensor = tensor.type(torch.float64 if dtype in int_types else dtype)
+            else:
+              # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+              factor = factor.type(torch.float32 if dtype in half_types else
+                                   torch.float64 if dtype in int_types else dtype)
+              tensor = tensor.type(torch.float32 if dtype in half_types else
+                                   torch.float64 if dtype in int_types else dtype)
+            multiplied = size * tensor
+            multiplied = multiplied * factor
+            multiplied = multiplied.type(dtype)
+            summed, multiplied = self.convert_cpu_fp16_to_fp32(summed, multiplied)
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in int_types:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert torch.allclose(summed, multiplied, threshold), 'hvd.allreduce produces incorrect results'
 
     def test_horovod_allreduce_error(self):
         """Test that the allreduce raises an error if different ranks try to
@@ -396,9 +496,9 @@ class TorchTests(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("No GPUs available")
 
-        if os.environ.get('HOROVOD_MIXED_INSTALL'):
-            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
-            self.skipTest("Not compiled with HOROVOD_GPU_ALLREDUCE")
+        if int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_OPERATIONS.
+            self.skipTest("Not compiled with HOROVOD_GPU_OPERATIONS")
 
         hvd.init()
         rank = hvd.rank()
@@ -449,9 +549,7 @@ class TorchTests(unittest.TestCase):
         # Only Tensors of floating point dtype can require gradients
         dtypes = [torch.FloatTensor, torch.DoubleTensor]
         if torch.cuda.is_available():
-            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             torch.manual_seed(1234)
@@ -475,9 +573,7 @@ class TorchTests(unittest.TestCase):
         # Only Tensors of floating point dtype can require gradients
         dtypes = [torch.FloatTensor, torch.DoubleTensor]
         if torch.cuda.is_available():
-            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             torch.manual_seed(1234)
@@ -502,15 +598,13 @@ class TorchTests(unittest.TestCase):
         size = hvd.size()
 
         dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
-                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.HalfTensor]
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
         if torch.cuda.is_available():
             dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
                        torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             tensor = torch.FloatTensor(*([17] * dim)).fill_(1).mul_(rank)
@@ -535,15 +629,13 @@ class TorchTests(unittest.TestCase):
         size = hvd.size()
 
         dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
-                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.HalfTensor]
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
         if torch.cuda.is_available():
             dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
                        torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             # Support tests up to MPI Size of 35
@@ -578,15 +670,13 @@ class TorchTests(unittest.TestCase):
         size = hvd.size()
 
         dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
-                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.HalfTensor]
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
         if torch.cuda.is_available():
             dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
                        torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         tests = []
         is_hvd_poll_false_once = False
@@ -687,9 +777,7 @@ class TorchTests(unittest.TestCase):
         # Only Tensors of floating point dtype can require gradients
         dtypes = [torch.FloatTensor, torch.DoubleTensor]
         if torch.cuda.is_available():
-            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         for dtype, dim in itertools.product(dtypes, dims):
             # Support tests up to MPI Size of 35
@@ -733,15 +821,13 @@ class TorchTests(unittest.TestCase):
             self.skipTest("Only one worker available")
 
         dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
-                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.HalfTensor]
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
         if torch.cuda.is_available():
             dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
                        torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         root_ranks = list(range(size))
         for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
@@ -769,15 +855,13 @@ class TorchTests(unittest.TestCase):
             self.skipTest("Only one worker available")
 
         dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
-                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor]
-        if _fp16_supported:
-            dtypes += [torch.HalfTensor]
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
         if torch.cuda.is_available():
             dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
                        torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         root_ranks = list(range(size))
         for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
@@ -890,9 +974,7 @@ class TorchTests(unittest.TestCase):
         # Only Tensors of floating point dtype can require gradients
         dtypes = [torch.FloatTensor, torch.DoubleTensor]
         if torch.cuda.is_available():
-            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
         dims = [1, 2, 3]
         root_ranks = list(range(size))
         for dtype, dim, root_rank in itertools.product(dtypes, dims, root_ranks):
@@ -906,6 +988,271 @@ class TorchTests(unittest.TestCase):
 
             c = size if rank == root_rank else 0
             expected = np.ones([17] * dim) * c
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_alltoall(self):
+        """Test that the alltoall correctly distributes 1D, 2D, and 3D tensors."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
+                       torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            splits = torch.tensor([rank + 1] * size, dtype=torch.int32)
+            tensor = self.cast_and_place(tensor, dtype)
+            collected = hvd.alltoall(tensor, splits)
+            tensor, collected = self.convert_cpu_fp16_to_fp32(tensor, collected)
+
+            assert collected.data.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.data.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.numel() == size * (size + 1) // 2 * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+
+    def test_horovod_alltoall_equal_split(self):
+        """Test that the alltoall correctly distributes 1D tensors with default splitting."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        dtypes = [torch.ByteTensor, torch.CharTensor, torch.ShortTensor,
+                  torch.IntTensor, torch.LongTensor, torch.FloatTensor, torch.DoubleTensor,
+                  torch.HalfTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.ByteTensor, torch.cuda.CharTensor, torch.cuda.ShortTensor,
+                       torch.cuda.IntTensor, torch.cuda.LongTensor,
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            tensor = self.cast_and_place(tensor, dtype)
+            collected = hvd.alltoall(tensor)
+            tensor, collected = self.convert_cpu_fp16_to_fp32(tensor, collected)
+
+            assert collected.data.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.data.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.numel() == size * (size + 1) // 2 * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+
+    def test_horovod_alltoall_type_error(self):
+        """Test that the alltoall returns an error if the tensor types differ
+           across the processes."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        if rank % 2:
+            tensor = torch.empty(size, dtype=torch.int32)
+        else:
+            tensor = torch.empty(size, dtype=torch.float32)
+        try:
+            hvd.alltoall(tensor)
+            assert False, 'hvd.alltoall did not throw error'
+        except (torch.FatalError, RuntimeError):
+            pass
+
+    def test_horovod_alltoall_equal_split_length_error(self):
+        """Test that the alltoall with default splitting returns an error if the tensor length is not a multiple
+        of the number of workers."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        tensor = torch.empty(size + 1)
+        try:
+            hvd.alltoall(tensor)
+            assert False, 'hvd.alltoall did not throw error'
+        except (torch.FatalError, ValueError):
+            pass
+
+    def test_horovod_alltoall_splits_error(self):
+        """Test that the alltoall returns an error if the sum of the splits entries exceeds
+        the first dimension of the input tensor."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        tensor = torch.empty(size - 1)
+        splits = torch.ones(size, dtype=torch.int32)
+        try:
+            hvd.alltoall(tensor, splits)
+            assert False, 'hvd.alltoall did not throw error'
+        except (torch.FatalError, ValueError):
+            pass
+
+    def test_horovod_alltoall_splits_type_error(self):
+        """Test that the alltoall returns an error if the splits tensor does not
+           contain 32-bit integers."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        tensor = torch.empty(size)
+        splits = torch.empty(size, dtype=torch.float32)
+        try:
+            hvd.alltoall(tensor, splits)
+            assert False, 'hvd.alltoall did not throw error'
+        except (torch.FatalError, ValueError):
+            pass
+
+    def test_horovod_alltoall_rank_error(self):
+        """Test that the alltoall returns an error if any dimension besides
+        the first is different among the tensors being processed."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        tensor_size = [2 * size] * 3
+        tensor_size[1] = 10 * (rank + 1)
+        tensor = torch.ones(tensor_size)
+
+        try:
+            hvd.alltoall(tensor)
+            assert False, 'hvd.alltoall did not throw error'
+        except (torch.FatalError, RuntimeError):
+            pass
+
+
+    def test_horovod_alltoall_grad(self):
+        """Test the correctness of the alltoall gradient."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            tensor = self.cast_and_place(tensor, dtype)
+            tensor.requires_grad_()
+            splits = torch.tensor([rank + 1] * size, dtype=torch.int32)
+            collected = hvd.alltoall(tensor, splits)
+
+            collected.backward(self.cast_and_place(torch.ones(collected.shape), dtype))
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            expected = np.ones(tensor.shape)
+            err = np.linalg.norm(expected - grad_out)
+            self.assertLess(err, 0.00000001,
+                            "gradient %s differs from expected %s, "
+                            "error: %s" % (grad_out, expected, str(err)))
+
+    def test_horovod_alltoall_equal_split_grad(self):
+        """Test the correctness of the alltoall gradient with default splitting."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        # Only Tensors of floating point dtype can require gradients
+        dtypes = [torch.FloatTensor, torch.DoubleTensor]
+        if torch.cuda.is_available():
+            dtypes += [torch.cuda.FloatTensor, torch.cuda.DoubleTensor, torch.cuda.HalfTensor]
+
+        dims = [1, 2, 3]
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = torch.Tensor(vals)
+            for _ in range(dim - 1):
+              tensor = tensor.unsqueeze(1)
+              tensor = torch.cat((tensor, tensor), dim=1)
+
+            tensor = self.cast_and_place(tensor, dtype)
+            tensor.requires_grad_()
+            collected = hvd.alltoall(tensor)
+
+            collected.backward(self.cast_and_place(torch.ones(collected.shape), dtype))
+            grad_out = tensor.grad.data.cpu().numpy()
+
+            expected = np.ones(tensor.shape)
             err = np.linalg.norm(expected - grad_out)
             self.assertLess(err, 0.00000001,
                             "gradient %s differs from expected %s, "
@@ -1127,8 +1474,6 @@ class TorchTests(unittest.TestCase):
             loss.backward()
             optimizer.step()
 
-    @pytest.mark.skipif(LooseVersion(torch.__version__) < LooseVersion('0.4.1'),
-                        reason='Cannot optimize parameters that do not require gradients before PyTorch 0.4.1')
     def test_broadcast_state_no_grad(self):
         class ModelNoGrad(nn.Module):
             def __init__(self, a, b):
@@ -1169,6 +1514,22 @@ class TorchTests(unittest.TestCase):
 
         obj = hvd.broadcast_object(obj, root_rank=0)
         self.assertDictEqual(obj, expected_obj)
+
+    def test_allgather_object(self):
+        hvd.init()
+
+        d = {'metric_val_1': hvd.rank()}
+        if hvd.rank() == 1:
+            d['metric_val_2'] = 42
+
+        results = hvd.allgather_object(d)
+
+        expected = [{'metric_val_1': i} for i in range(hvd.size())]
+        if hvd.size() > 1:
+            expected[1] = {'metric_val_1': 1, 'metric_val_2': 42}
+
+        self.assertEqual(len(results), hvd.size())
+        self.assertListEqual(results, expected)
 
     def test_compression_fp16(self):
         valid_dtypes = [torch.float32, torch.float64]
@@ -1542,10 +1903,6 @@ class TorchTests(unittest.TestCase):
 
     def test_horovod_join_allreduce(self):
         """Test Join op with allreduce."""
-        # "Join Op is not supported for PyTorch < 1.0"
-        if not _v2_api:
-            self.skipTest("Join Op not available")
-
         hvd.init()
         rank = hvd.rank()
         size = hvd.size()
@@ -1554,14 +1911,21 @@ class TorchTests(unittest.TestCase):
                      torch.FloatTensor, torch.DoubleTensor])
         if torch.cuda.is_available():
             dtypes += [torch.cuda.IntTensor, torch.cuda.LongTensor,
-                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor]
-            if _fp16_supported:
-                dtypes += [torch.cuda.HalfTensor]
+                       torch.cuda.FloatTensor, torch.cuda.DoubleTensor,
+                       torch.cuda.HalfTensor]
+
+        integral_types = [torch.IntTensor, torch.LongTensor, torch.cuda.IntTensor, torch.cuda.LongTensor]
+
         dims = [1, 2, 3]
         first_join_ranks = [0, 1]
         cachings = [False, True]
         for dtype, dim, first_join_rank, caching in itertools.product(dtypes, dims, first_join_ranks, cachings):
             torch.manual_seed(1234)
+
+            def div(t, s):
+                if _1_5_api and dtype in integral_types:
+                    return t.floor_divide(s)
+                return t / s
 
             # Use two tensors to test fusion
             tensor_a = torch.FloatTensor(*([5] * dim)).random_(-100, 100)
@@ -1590,12 +1954,9 @@ class TorchTests(unittest.TestCase):
                 else:
                     ret = hvd.join()
 
-                max_difference_a = averaged_a.data.sub(tensor_a * (size - 1) / size).max()
-                max_difference_b = averaged_b.data.sub(tensor_b * (size - 1) / size).max()
                 # Threshold for floating point equality depends on number of
                 # ranks, since we're comparing against precise multiplication.
-                if size <= 3 or dtype in [torch.IntTensor, torch.LongTensor,
-                                        torch.cuda.IntTensor, torch.cuda.LongTensor]:
+                if size <= 3 or dtype in integral_types:
                     threshold = 0
                 elif size < 10:
                     threshold = 1e-4
@@ -1603,15 +1964,13 @@ class TorchTests(unittest.TestCase):
                     threshold = 5e-4
                 else:
                     break
-                assert max_difference_a <= threshold, 'hvd.join with hvd.allreduce produces incorrect results'
-                assert max_difference_b <= threshold, 'hvd.join with hvd.allreduce produces incorrect results'
+                assert torch.allclose(averaged_a, div(tensor_a * (size - 1), size), threshold), \
+                    'hvd.join with hvd.allreduce produces incorrect results'
+                assert torch.allclose(averaged_b, div(tensor_b * (size - 1), size), threshold), \
+                    'hvd.join with hvd.allreduce produces incorrect results'
 
     def test_horovod_join_allgather(self):
         """Test Join op with allgather."""
-        # "Join Op is not supported for PyTorch < 1.0"
-        if not _v2_api:
-            self.skipTest("Join Op not available")
-
         hvd.init()
         rank = hvd.rank()
         size = hvd.size()
@@ -1639,10 +1998,6 @@ class TorchTests(unittest.TestCase):
 
     def test_horovod_join_broadcast(self):
         """Test Join op with allgather."""
-        # "Join Op is not supported for PyTorch < 1.0"
-        if not _v2_api:
-            self.skipTest("Join Op not available")
-
         hvd.init()
         rank = hvd.rank()
         size = hvd.size()
@@ -1667,6 +2022,115 @@ class TorchTests(unittest.TestCase):
                 ret = hvd.join(hvd.local_rank())
             else:
                 ret = hvd.join()
+    
+    def test_horovod_sync_batch_norm(self):
+        """Tests Horovod version of SyncBatchNorm."""
+        if not torch.cuda.is_available():
+            self.skipTest("No GPUs available")
+
+        hvd.init()
+
+        ts_list = [
+            torch.stack([
+                torch.tensor([
+                    [r, r + 1],
+                    [r * 2, r * 2 + 1],
+                    [r * 3, r * 3 + 1],
+                    [r * 4, r * 4 + 1]
+                ])
+                for r in range(hvd.size())
+            ]),
+            torch.stack([
+                torch.tensor([
+                    [r + 1],
+                    [r * 2 + 1],
+                    [r * 3 + 1],
+                    [r * 4 + 1]
+                ])
+                for r in range(hvd.size())
+            ]),
+        ]
+
+        for ts in ts_list:
+            sync_bn = hvd.SyncBatchNorm(num_features=4)
+            sync_bn.cuda(hvd.local_rank())
+
+            bn = torch.nn.BatchNorm1d(num_features=4)
+            bn.cuda(hvd.local_rank())
+
+            ts = ts.cuda(hvd.local_rank()).float()
+            ts1 = ts.clone().requires_grad_()
+            ts2 = ts.clone().requires_grad_()
+
+            # Training
+            sync_bn_out = sync_bn(ts1[hvd.rank()].unsqueeze(0))
+            bn_out = bn(ts2)
+            assert torch.allclose(sync_bn_out, bn_out[hvd.rank()].unsqueeze(0), 1e-6)
+            assert torch.allclose(sync_bn.running_mean, bn.running_mean, 1e-6)
+            assert torch.allclose(sync_bn.running_var, bn.running_var, 1e-6)
+
+            # Gradients
+            sync_bn_out.sum().backward()
+            bn_out.mean(dim=0).sum().backward()
+            assert torch.allclose(hvd.allreduce(sync_bn.weight.grad, name='sync_bn.weight.grad'), bn.weight.grad,  1e-6)
+            assert torch.allclose(hvd.allreduce(sync_bn.bias.grad, name='sync_bn.bias.grad'), bn.bias.grad, 1e-6)
+            assert torch.allclose(hvd.allreduce(ts1.grad, name='ts1.grad'), ts2.grad, 1e-6)
+
+    def test_elastic_state(self):
+        hvd.init()
+
+        v = 1.0 if hvd.rank() == 0 else 2.0
+        model1 = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        model1.load_state_dict({
+            '0.weight': torch.tensor([[v, v], [v, v]]),
+            '0.bias': torch.tensor([v, v])
+        })
+
+        model2 = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        model2.load_state_dict({
+            '0.weight': torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            '0.bias': torch.tensor([0.0, 0.0])
+        })
+
+        optimizer = torch.optim.SGD(model1.parameters(), lr=0.001 * hvd.size())
+
+        state = hvd.elastic.TorchState(model1, optimizer, batch=20 + hvd.rank(), epoch=10 + hvd.rank())
+        state.sync()
+
+        model1_weights = model1.state_dict().values()
+        model2_weights = model2.state_dict().values()
+
+        # After sync, all values should match the root rank
+        for w in state.model.state_dict().values():
+            np.testing.assert_allclose(w, np.ones_like(w))
+        assert state.batch == 20
+        assert state.epoch == 10
+
+        # Partially modify then restore
+        model1.load_state_dict(model2.state_dict())
+        state.batch = 21
+        state.epoch = 11
+
+        state.restore()
+
+        for w1, w2 in zip(model1.state_dict().values(), model1_weights):
+            np.testing.assert_allclose(w1, w2)
+        assert state.batch == 20
+        assert state.epoch == 10
+
+        # Partially modify then commit
+        model1.load_state_dict(model2.state_dict())
+        state.batch = 21
+        state.epoch = 11
+
+        state.commit()
+        state.restore()
+
+        for w1, w2 in zip(model1.state_dict().values(), model2_weights):
+            np.testing.assert_allclose(w1, w2)
+        assert state.batch == 21
+        assert state.epoch == 11
+
 
 if __name__ == "__main__":
    unittest.main()

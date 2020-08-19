@@ -1,5 +1,6 @@
 // Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,8 +51,19 @@ int GetDeviceID(const ::torch::Tensor& tensor) {
 
 } // namespace
 
+void DivideInPlace(::torch::Tensor& tensor, int divisor) {
+#if TORCH_VERSION >= 1005000000
+  if (isIntegralType(tensor.scalar_type())) {
+    tensor.floor_divide_(divisor);
+    return;
+  }
+#endif
+  tensor.div_(divisor);
+}
+
 int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int divisor,
-                const std::string& name, int reduce_op_int) {
+                const std::string& name, int reduce_op_int,
+                double prescale_factor, double postscale_factor) {
   ThrowIfError(common::CheckInitialized());
 
   auto handle = handle_manager.AllocateHandle();
@@ -69,17 +81,18 @@ int DoAllreduce(::torch::Tensor tensor, ::torch::Tensor output, int divisor,
       [handle, divisor, output](const Status& status) mutable {
         // Will execute in the `device` context.
         if (divisor > 1) {
-          output.div_(divisor);
+          DivideInPlace(output, divisor);
         }
         handle_manager.MarkDone(handle, status);
-      }, reduce_op);
+      }, reduce_op, prescale_factor, postscale_factor);
   ThrowIfError(enqueue_result);
 
   return handle;
 }
 
 int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int divisor,
-                         const std::string& name, int reduce_op_int) {
+                         const std::string& name, int reduce_op_int,
+                         double prescale_factor, double postscale_factor) {
   ThrowIfError(common::CheckInitialized());
 
   // Make async copy of input tensor to CPU tensor and record completion event.
@@ -104,10 +117,10 @@ int DoAllreduceCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int div
         with_device device_guard(device);
         output.copy_(cpu_buffer);
         if (divisor > 1) {
-          output.div_(divisor);
+          DivideInPlace(output, divisor);
         }
         handle_manager.MarkDone(handle, status);
-      }, reduce_op);
+      }, reduce_op, prescale_factor, postscale_factor);
   ThrowIfError(enqueue_result);
 
   return handle;
@@ -227,11 +240,78 @@ int DoBroadcastCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor output, int roo
   return handle;
 }
 
+int DoAlltoall(::torch::Tensor tensor, ::torch::Tensor splits, ::torch::Tensor output, const std::string& name) {
+  ThrowIfError(common::CheckInitialized());
+
+  auto device = GetDeviceID(tensor);
+  auto ready_event = RecordReadyEvent(device);
+  auto hvd_tensor = std::make_shared<TorchTensor>(tensor);
+  auto hvd_context = std::make_shared<TorchOpContext>(device, output);
+
+  // Make sync copy of splits tensor to CPU if needed
+  auto splits_cpu = (GetDeviceID(splits) != CPU_DEVICE_ID) ?
+      splits.to(::torch::Device(::torch::kCPU), /*non_blocking=*/false) :
+      splits;
+  auto splits_tensor = std::make_shared<TorchTensor>(splits_cpu);
+
+  auto handle = handle_manager.AllocateHandle();
+  auto enqueue_result =
+      EnqueueTensorAlltoall(hvd_context, hvd_tensor, splits_tensor, ready_event,
+                             GetOpName("alltoall", name, handle), device,
+                             [handle](const Status& status) {
+                               handle_manager.MarkDone(handle, status);
+                             });
+  ThrowIfError(enqueue_result);
+
+  return handle;
+}
+
+int DoAlltoallCudaOnCPU(::torch::Tensor tensor, ::torch::Tensor splits, ::torch::Tensor output,
+                         const std::string& name) {
+  ThrowIfError(common::CheckInitialized());
+
+  // Make sync copy of splits tensor to CPU if needed
+  auto splits_cpu = (GetDeviceID(splits) != CPU_DEVICE_ID) ?
+      splits.to(::torch::Device(::torch::kCPU), /*non_blocking=*/false) :
+      splits;
+  auto splits_tensor = std::make_shared<TorchTensor>(splits_cpu);
+
+  // Make async copy of input tensor to CPU tensor and record completion event.
+  auto device = GetDeviceID(tensor);
+  auto cpu_tensor =
+      tensor.to(::torch::Device(::torch::kCPU), /*non_blocking=*/true);
+  auto hvd_cpu_tensor = std::make_shared<TorchTensor>(cpu_tensor);
+  auto ready_event = RecordReadyEvent(device);
+
+  auto cpu_output = ::torch::empty_like(cpu_tensor);
+  auto hvd_cpu_output = std::make_shared<TorchTensor>(cpu_output);
+  auto hvd_context =
+      std::make_shared<TorchOpContext>(CPU_DEVICE_ID, cpu_output);
+
+  auto handle = handle_manager.AllocateHandle();
+  auto enqueue_result = EnqueueTensorAlltoall(
+      hvd_context, hvd_cpu_tensor, splits_tensor, ready_event,
+      GetOpName("alltoall", name, handle), CPU_DEVICE_ID,
+      [handle, cpu_output, output, device](const Status& status) mutable {
+        // Since the operation was on CPU, need to perform copy with the GPU
+        // device guard.
+        with_device device_guard(device);
+        // output needs to be resized before copying in the CPU tensor.
+        output.resize_(cpu_output.sizes());
+        output.copy_(cpu_output);
+        handle_manager.MarkDone(handle, status);
+      });
+  ThrowIfError(enqueue_result);
+
+  return handle;
+}
+
 int PollHandle(int handle) { return handle_manager.PollHandle(handle) ? 1 : 0; }
 
 void WaitAndClear(int handle) {
-  while (!handle_manager.PollHandle(handle)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  while (true) {
+    if (handle_manager.PollHandle(handle)) break;
+    std::this_thread::yield();
   }
   auto status = handle_manager.ReleaseHandle(handle);
   ThrowIfError(*status);
@@ -259,6 +339,10 @@ int DoJoin(int device) {
 
   WaitAndClear(handle);
   return handle;
+}
+
+void Reset() {
+  handle_manager.Reset();
 }
 
 
@@ -362,12 +446,50 @@ PYBIND11_MODULE(mpi_lib_v2, m) {
         &DoBroadcastCudaOnCPU);
 #endif
 
+  // alltoall
+  m.def("horovod_torch_alltoall_async_torch_ByteTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_CharTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_ShortTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_IntTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_LongTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_HalfTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_FloatTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_DoubleTensor", &DoAlltoall);
+#if HOROVOD_GPU_ALLTOALL
+  m.def("horovod_torch_alltoall_async_torch_cuda_ByteTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_CharTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_ShortTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_IntTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_LongTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_HalfTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_FloatTensor", &DoAlltoall);
+  m.def("horovod_torch_alltoall_async_torch_cuda_DoubleTensor", &DoAlltoall);
+#else
+  m.def("horovod_torch_alltoall_async_torch_cuda_ByteTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_CharTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_ShortTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_IntTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_LongTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_HalfTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_FloatTensor",
+        &DoAlltoallCudaOnCPU);
+  m.def("horovod_torch_alltoall_async_torch_cuda_DoubleTensor",
+        &DoAlltoallCudaOnCPU);
+#endif
+
   // join
   m.def("horovod_torch_join", &DoJoin);
 
   // basics
   m.def("horovod_torch_poll", &PollHandle);
   m.def("horovod_torch_wait_and_clear", &WaitAndClear);
+  m.def("horovod_torch_reset", &Reset);
 }
 
 } // namespace torch

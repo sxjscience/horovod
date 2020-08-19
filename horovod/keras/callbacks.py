@@ -36,7 +36,7 @@ class BroadcastGlobalVariablesCallback(_impl.BroadcastGlobalVariablesCallbackImp
         Args:
             root_rank: Rank that will send data, other ranks will receive data.
             device: Device to be used for broadcasting. Uses GPU by default
-                    if Horovod was build with HOROVOD_GPU_BROADCAST.
+                    if Horovod was build with HOROVOD_GPU_OPERATIONS.
         """
         super(BroadcastGlobalVariablesCallback, self).__init__(K, root_rank, device)
 
@@ -58,7 +58,7 @@ class MetricAverageCallback(_impl.MetricAverageCallbackImpl, keras.callbacks.Cal
 
         Args:
             device: Device to be used for allreduce. Uses GPU by default
-                    if Horovod was build with HOROVOD_GPU_ALLREDUCE.
+                    if Horovod was build with HOROVOD_GPU_OPERATIONS.
         """
         super(MetricAverageCallback, self).__init__(K, device)
 
@@ -83,7 +83,7 @@ class LearningRateScheduleCallback(_impl.LearningRateScheduleCallbackImpl, keras
     """
 
     def __init__(self, multiplier, start_epoch=0, end_epoch=None, staircase=True,
-                 momentum_correction=True, steps_per_epoch=None):
+                 momentum_correction=True, steps_per_epoch=None, initial_lr=None):
         """
         Construct a new LearningRateScheduleCallback.
 
@@ -99,9 +99,14 @@ class LearningRateScheduleCallback(_impl.LearningRateScheduleCallbackImpl, keras
             steps_per_epoch: The callback will attempt to autodetect number of batches per
                              epoch with Keras >= 2.0.0. Provide this value if you have an older
                              version of Keras.
+            initial_lr: Initial learning rate at the start of training.
+
+                .. warning:: Will be required in v0.21.0.
+
         """
         super(LearningRateScheduleCallback, self).__init__(K, multiplier, start_epoch, end_epoch,
-                                                           staircase, momentum_correction, steps_per_epoch)
+                                                           staircase, momentum_correction, steps_per_epoch,
+                                                           initial_lr)
 
 
 class LearningRateWarmupCallback(_impl.LearningRateWarmupCallbackImpl, keras.callbacks.Callback):
@@ -129,7 +134,7 @@ class LearningRateWarmupCallback(_impl.LearningRateWarmupCallbackImpl, keras.cal
     """
 
     def __init__(self, warmup_epochs=5, momentum_correction=True, steps_per_epoch=None,
-                 verbose=0):
+                 verbose=0, initial_lr=None):
         """
         Construct a new LearningRateWarmupCallback that will gradually warm up the learning rate.
 
@@ -141,6 +146,24 @@ class LearningRateWarmupCallback(_impl.LearningRateWarmupCallbackImpl, keras.cal
                              epoch with Keras >= 2.0.0. Provide this value if you have an older
                              version of Keras.
             verbose: verbosity mode, 0 or 1.
+            initial_lr: Initial learning rate at the start of training.
+
+                .. warning:: Will be required in v0.21.0.
         """
         super(LearningRateWarmupCallback, self).__init__(K, warmup_epochs, momentum_correction,
-                                                         steps_per_epoch, verbose)
+                                                         steps_per_epoch, verbose, initial_lr)
+
+
+class BestModelCheckpoint(keras.callbacks.ModelCheckpoint):
+    def __init__(self,
+                 monitor='val_loss',
+                 verbose=0,
+                 mode='auto',
+                 save_freq='epoch'):
+        super(BestModelCheckpoint, self).__init__(filepath=None,
+                                                  monitor=monitor,
+                                                  verbose=verbose,
+                                                  save_best_only=True,
+                                                  save_weights_only=False,
+                                                  mode=mode,
+                                                  save_freq=save_freq)

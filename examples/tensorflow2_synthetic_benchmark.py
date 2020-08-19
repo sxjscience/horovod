@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import absolute_import, division, print_function
-
 import argparse
 import os
 import numpy as np
@@ -43,6 +41,7 @@ parser.add_argument('--num-iters', type=int, default=10,
 
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
+
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda
@@ -76,7 +75,7 @@ def benchmark_step(first_batch):
     # Horovod: use DistributedGradientTape
     with tf.GradientTape() as tape:
         probs = model(data, training=True)
-        loss = tf.losses.categorical_crossentropy(target, probs)
+        loss = tf.losses.sparse_categorical_crossentropy(target, probs)
 
     # Horovod: add Horovod Distributed GradientTape.
     tape = hvd.DistributedGradientTape(tape, compression=compression)

@@ -1,6 +1,7 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2018 Uber Technologies, Inc.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +28,23 @@
 #define EIGEN_USE_THREADS
 
 #if HAVE_GPU
+
+#if HAVE_CUDA
+#include <cuda_runtime.h>
+using GpuStreamHandle = cudaStream_t;
+#define gpuMemsetAsync cudaMemsetAsync
+#elif HAVE_ROCM
+#include <hip/hip_runtime.h>
+using GpuStreamHandle = hipStream_t;
+#define gpuMemsetAsync hipMemsetAsync
+#endif
+
+// Forward declaration of AsGpuStreamValue
+namespace stream_executor {
+namespace gpu {
+GpuStreamHandle AsGpuStreamValue(Stream* stream);
+} // namespace stream_executor
+} // namespace gpu
 #include "tensorflow/stream_executor/stream.h"
 #endif
 
@@ -40,6 +58,33 @@ namespace horovod {
 namespace tensorflow {
 
 namespace {
+
+::tensorflow::DataType GetTFDataType(common::DataType dtype) {
+  switch (dtype) {
+  case common::HOROVOD_UINT8:
+    return DT_UINT8;
+  case common::HOROVOD_INT8:
+    return DT_INT8;
+  case common::HOROVOD_UINT16:
+    return DT_UINT16;
+  case common::HOROVOD_INT16:
+    return DT_INT16;
+  case common::HOROVOD_INT32:
+    return DT_INT32;
+  case common::HOROVOD_INT64:
+    return DT_INT64;
+  case common::HOROVOD_FLOAT16:
+    return DT_HALF;
+  case common::HOROVOD_FLOAT32:
+    return DT_FLOAT;
+  case common::HOROVOD_FLOAT64:
+    return DT_DOUBLE;
+  case common::HOROVOD_BOOL:
+    return DT_BOOL;
+  default:
+    throw std::logic_error("Invalid data type.");
+  }
+}
 
 Status ConvertStatus(const common::Status& status) {
   switch (status.type()) {
@@ -248,11 +293,50 @@ TFOpContext::AllocateOutput(common::TensorShape shape,
   return ConvertStatus(status);
 }
 
+int GetDeviceID(OpKernelContext* context);
+
 common::Status
 TFOpContext::AllocateZeros(int64_t num_elements, common::DataType dtype,
                            std::shared_ptr<common::Tensor>* tensor) {
-  return common::Status::PreconditionError(
-      "AllocateZeros is not supported for TensorFlow yet.");
+  ::tensorflow::Tensor* unused;
+  std::shared_ptr<PersistentTensor> zero_tensor = std::make_shared<PersistentTensor>();
+  auto tf_data_type = GetTFDataType(dtype);
+  ::tensorflow::AllocatorAttributes tf_attribute;
+  int device_ = GetDeviceID(context_);
+  auto hvd_context = std::make_shared<TFOpContext>(context_);
+  if (device_ != CPU_DEVICE_ID) {
+    tf_attribute.set_on_host(false);
+  } else {
+    tf_attribute.set_on_host(true);
+  }
+
+  Status status = context_->allocate_persistent(tf_data_type, ::tensorflow::TensorShape({num_elements}), zero_tensor.get(), &unused, tf_attribute);
+
+  if (device_ != CPU_DEVICE_ID) {
+#if HAVE_GPU
+    auto device_context = context_->op_device_context();
+    auto stream = (device_context != nullptr) ? stream_executor::gpu::AsGpuStreamValue(device_context->stream()) : 0;
+    void *ptr = (void*)zero_tensor->AccessTensor(hvd_context->GetKernelContext())->tensor_data().data();
+    auto size = zero_tensor->AccessTensor(hvd_context->GetKernelContext())->tensor_data().size();
+    gpuMemsetAsync(ptr, 0, size, stream);
+#endif
+  } else {
+    memset((void*)zero_tensor->AccessTensor(hvd_context->GetKernelContext())->tensor_data().data(), 0,
+           zero_tensor->AccessTensor(hvd_context->GetKernelContext())->tensor_data().size());
+  }
+  if (status.ok()) {
+    *tensor = std::make_shared<TFTensor>(*(zero_tensor->AccessTensor(hvd_context->GetKernelContext())));
+  }
+
+#if HAVE_GPU
+  // On GPU allocation is asynchronous, we need to wait for it to
+  // complete.
+  auto device_context = context_->op_device_context();
+  if (device_context != nullptr) {
+    device_context->stream()->BlockHostUntilDone();
+  }
+#endif
+  return ConvertStatus(status);
 }
 
 common::Framework TFOpContext::framework() const {
@@ -289,6 +373,8 @@ public:
   explicit HorovodAllreduceOp(OpKernelConstruction* context)
       : AsyncOpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("reduce_op", &reduce_op_));
+    OP_REQUIRES_OK(context, context->GetAttr("prescale_factor", &prescale_factor_));
+    OP_REQUIRES_OK(context, context->GetAttr("postscale_factor", &postscale_factor_));
   }
 
   void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
@@ -312,12 +398,15 @@ public:
         [context, done](const common::Status& status) {
           context->SetStatus(ConvertStatus(status));
           done();
-        }, reduce_op);
+        }, reduce_op, (double) prescale_factor_, (double) postscale_factor_);
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
   }
 
 private:
   int reduce_op_;
+  // Using float since TF does not support double OP attributes
+  float prescale_factor_;
+  float postscale_factor_;
 };
 
 REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_CPU),
@@ -330,6 +419,8 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAllreduce").Device(DEVICE_GPU),
 REGISTER_OP("HorovodAllreduce")
     .Attr("T: {int32, int64, float16, float32, float64}")
     .Attr("reduce_op: int")
+    .Attr("prescale_factor: float")
+    .Attr("postscale_factor: float")
     .Input("tensor: T")
     .Output("sum: T")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
@@ -375,7 +466,7 @@ public:
         });
     OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
   }
-}; // namespace tensorflow
+};
 
 REGISTER_KERNEL_BUILDER(Name("HorovodAllgather").Device(DEVICE_CPU),
                         HorovodAllgatherOp);
@@ -478,6 +569,215 @@ Arguments
 Output
     output:    A tensor with the same shape as `tensor` and same value as
                `tensor` on root rank.
+)doc");
+
+class HorovodJoinOp : public AsyncOpKernel {
+public:
+  explicit HorovodJoinOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {}
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
+                         done);
+    auto device = GetDeviceID(context);
+    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    auto hvd_context = std::make_shared<TFOpContext>(context);
+    auto enqueue_result = EnqueueJoin(
+      hvd_context, ready_event,
+      JOIN_TENSOR_NAME, device,
+        [context, done](const common::Status& status) {
+          context->SetStatus(ConvertStatus(status));
+          done();
+        });
+
+   OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
+  }
+};
+
+REGISTER_KERNEL_BUILDER(Name("HorovodJoin").Device(DEVICE_CPU),
+                        HorovodJoinOp);
+#if HOROVOD_GPU_ALLREDUCE
+REGISTER_KERNEL_BUILDER(Name("HorovodJoin").Device(DEVICE_GPU),
+                        HorovodJoinOp);
+#endif
+
+REGISTER_OP("HorovodJoin")
+    .Doc(R"doc(
+Perform an join on a tensor,
+)doc");
+
+template <typename T, T f()> class HorovodReturnScalarOp : public OpKernel {
+public:
+  explicit HorovodReturnScalarOp(OpKernelConstruction* context)
+      : OpKernel(context) {}
+
+  void Compute(OpKernelContext* context) override {
+    OP_REQUIRES_OK(context, ConvertStatus(common::CheckInitialized()));
+
+    // Write integer to output tensor
+    Tensor* output;
+    OP_REQUIRES_OK(context,
+                   context->allocate_output(0, TensorShape({}), &output));
+
+    auto flat = output->flat<T>();
+    flat(0) = f();
+  }
+};
+
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodSize").Device(DEVICE_CPU).HostMemory("size"),
+    HorovodReturnScalarOp<int, common::horovod_size>);
+#if HAVE_GPU
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodSize").Device(DEVICE_GPU).HostMemory("size"),
+    HorovodReturnScalarOp<int, common::horovod_size>);
+#endif
+
+REGISTER_OP("HorovodSize")
+    .Output("size: int32")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Scalar());
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Returns the number of Horovod processes.
+
+Output
+    size:    An integer scalar containing the number of Horovod processes.
+)doc");
+
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodLocalSize").Device(DEVICE_CPU).HostMemory("local_size"),
+    HorovodReturnScalarOp<int, common::horovod_local_size>);
+#if HAVE_GPU
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodLocalSize").Device(DEVICE_GPU).HostMemory("local_size"),
+    HorovodReturnScalarOp<int, common::horovod_local_size>);
+#endif
+
+REGISTER_OP("HorovodLocalSize")
+    .Output("local_size: int32")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Scalar());
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Returns the number of Horovod processes within the node the current process is
+running on.
+
+Output
+    local_size:    An integer scalar containing the number of local Horovod
+                   processes.
+)doc");
+
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodRank").Device(DEVICE_CPU).HostMemory("rank"),
+    HorovodReturnScalarOp<int, common::horovod_rank>);
+#if HAVE_GPU
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodRank").Device(DEVICE_GPU).HostMemory("rank"),
+    HorovodReturnScalarOp<int, common::horovod_rank>);
+#endif
+
+REGISTER_OP("HorovodRank")
+    .Output("rank: int32")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Scalar());
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Returns the Horovod rank of the calling process.
+
+Output
+    rank:    An integer scalar with the Horovod rank of the calling process.
+)doc");
+
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodLocalRank").Device(DEVICE_CPU).HostMemory("local_rank"),
+    HorovodReturnScalarOp<int, common::horovod_local_rank>);
+#if HAVE_GPU
+REGISTER_KERNEL_BUILDER(
+    Name("HorovodLocalRank").Device(DEVICE_GPU).HostMemory("local_rank"),
+    HorovodReturnScalarOp<int, common::horovod_local_rank>);
+#endif
+
+REGISTER_OP("HorovodLocalRank")
+    .Output("local_rank: int32")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->Scalar());
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Returns the local Horovod rank of the calling process, within the node that it
+is running on. For example, if there are seven processes running on a node,
+their local ranks will be zero through six, inclusive.
+
+Output
+    local_rank:    An integer scalar with the local Horovod rank of the calling
+                   process.
+)doc");
+
+class HorovodAlltoallOp : public AsyncOpKernel {
+public:
+  explicit HorovodAlltoallOp(OpKernelConstruction* context)
+      : AsyncOpKernel(context) {}
+
+  void ComputeAsync(OpKernelContext* context, DoneCallback done) override {
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(common::CheckInitialized()),
+                         done);
+
+    auto node_name = name();
+    auto device = GetDeviceID(context);
+    auto tensor = context->input(0);
+    auto splits = context->input(1);
+    auto ready_event = std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context));
+    auto hvd_context = std::make_shared<TFOpContext>(context);
+    auto hvd_tensor = std::make_shared<TFTensor>(tensor);
+    auto splits_tensor = std::make_shared<TFTensor>(splits);
+    auto enqueue_result = EnqueueTensorAlltoall(
+        hvd_context, hvd_tensor, splits_tensor, ready_event, node_name, device,
+        [context, done](const common::Status& status) {
+          context->SetStatus(ConvertStatus(status));
+          done();
+        });
+    OP_REQUIRES_OK_ASYNC(context, ConvertStatus(enqueue_result), done);
+  }
+}; // namespace tensorflow
+
+REGISTER_KERNEL_BUILDER(Name("HorovodAlltoall").Device(DEVICE_CPU),
+                        HorovodAlltoallOp);
+#if HOROVOD_GPU_ALLTOALL
+REGISTER_KERNEL_BUILDER(Name("HorovodAlltoall").Device(DEVICE_GPU).HostMemory("splits"),
+                        HorovodAlltoallOp);
+#endif
+
+REGISTER_OP("HorovodAlltoall")
+    .Attr(
+        "T: {uint8, int8, uint16, int16, int32, int64, float16, float32, float64, bool}")
+    .Input("tensor: T")
+    .Input("splits: int32")
+    .Output("output: T")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle output;
+      TF_RETURN_IF_ERROR(
+          c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
+      c->set_output(0, output);
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Perform an MPI Alltoall on a tensor.
+
+Arguments
+    tensor:     A tensor to be distributed with all to all
+    splits: A list of integers in rank order describing how many elements
+                in `tensor` to send to each worker.
+
+Output
+    output:    The collected tensor data from all workers.
 )doc");
 
 } // namespace tensorflow

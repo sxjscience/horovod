@@ -13,8 +13,8 @@ void GPUContext::RecordEvent(std::queue<std::pair<std::string, gpuEvent_t>>& eve
   pimpl->RecordEvent(event_queue, name, stream);
 }
 
-void GPUContext::WaitForEvents(std::queue<std::pair<std::string, gpuEvent_t>>& event_queue, const std::vector<TensorTableEntry>& entries, Timeline& timeline) {
-  pimpl->WaitForEvents(event_queue, entries, timeline);
+void GPUContext::WaitForEvents(std::queue<std::pair<std::string, gpuEvent_t>>& event_queue, const std::vector<TensorTableEntry>& entries, Timeline& timeline, const std::function<void()>& error_check_callback) {
+  pimpl->WaitForEvents(event_queue, entries, timeline, error_check_callback);
 }
 
 void GPUContext::StreamCreate(gpuStream_t *stream) {
@@ -43,5 +43,10 @@ void GPUContext::MemcpyAsyncH2D(void* dst, const void* src, size_t count, gpuStr
 
 void GPUContext::MemcpyAsyncD2H(void* dst, const void* src, size_t count, gpuStream_t stream) {
   pimpl->MemcpyAsyncD2H(dst, src, count, stream);
+}
+
+void GPUContext::ScaleBufferImpl(const void* fused_input_data, void* buffer_data, int64_t num_elements,
+                                 double scale_factor, DataType dtype, gpuStream_t stream) {
+  pimpl->ScaleBufferImpl(fused_input_data, buffer_data, num_elements, scale_factor, dtype, stream);
 }
 

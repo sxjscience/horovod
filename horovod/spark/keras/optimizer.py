@@ -13,17 +13,11 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import copy
 import io
 
-import six
 import h5py
 
-from horovod.run.common.util import codec
+from horovod.runner.common.util import codec
 
 
 def serialize_bare_keras_optimizer(x):
@@ -70,28 +64,12 @@ def _serialize_keras_optimizer(opt, optimizer_class, save_optimizer_fn):
 
 
 def is_string(obj):
-    if six.PY3:
-        return isinstance(obj, str)
-    if six.PY2:
-        if not isinstance(obj, str):
-            return False
-
-        # Now we need to check if it is not byte array. Bytearrays in python 2 are essentially an
-        # instance of string. There is not a good way to distinguish between the two types other than
-        # trying to decode the object
-        # https://stackoverflow.com/questions/34869889/what-is-the-proper-way-to-determine-if-an-object-is-a-bytes-like-object-in-pytho
-        obj_copy = copy.copy(obj)
-        try:
-            obj_copy.decode('ascii')
-            return True
-        except (UnicodeDecodeError, AttributeError):
-            return False
+    return isinstance(obj, str)
 
 
 def _deserialize_keras_optimizer(serialized_opt, load_keras_optimizer_fn):
     if is_string(serialized_opt):
         return serialized_opt
-    else:
-        bio = io.BytesIO(serialized_opt)
-        with h5py.File(bio, 'r') as f:
-            return load_keras_optimizer_fn(f)
+    bio = io.BytesIO(serialized_opt)
+    with h5py.File(bio, 'r') as f:
+        return load_keras_optimizer_fn(f)

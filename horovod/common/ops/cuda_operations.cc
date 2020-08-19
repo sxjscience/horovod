@@ -15,6 +15,8 @@
 // =============================================================================
 
 #include "gpu_operations.h"
+#include "cuda/cuda_kernels.h"
+#include "../message.h"
 
 #include <thread>
 
@@ -41,7 +43,7 @@ public:
       }
     }
 
-    return cudaEventCreateWithFlags(event, cudaEventBlockingSync | cudaEventDisableTiming);
+    return cudaEventCreateWithFlags(event, cudaEventDisableTiming);
   }
 
   cudaError_t ReleaseGpuEvent(cudaEvent_t event) {
@@ -75,7 +77,8 @@ public:
   }
 
   void WaitForEvents(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue,
-      const std::vector<TensorTableEntry>& entries, Timeline& timeline) {
+      const std::vector<TensorTableEntry>& entries, Timeline& timeline,
+      const std::function<void()>& error_check_callback) {
     while (!event_queue.empty()) {
       std::string name;
       cudaEvent_t event;
@@ -84,7 +87,25 @@ public:
       if (name != "") {
         timeline.ActivityStartAll(entries, name);
       }
-      ErrorCheck("cudaEventSynchronize", cudaEventSynchronize(event));
+
+      // Check for async (networking) errors while waiting for the event to complete
+      cudaError_t cuda_result;
+      while (true) {
+        cuda_result = cudaEventQuery(event);
+        if (cuda_result == cudaSuccess) {
+          break;
+        }
+
+        if (cuda_result != cudaErrorNotReady) {
+          throw std::logic_error(std::string("cudaEventQuery failed: ") + cudaGetErrorString(cuda_result));
+        }
+
+        if (error_check_callback) {
+          error_check_callback();
+        }
+        std::this_thread::yield();
+      }
+
       if (name != "") {
         timeline.ActivityEndAll(entries);
       }
@@ -124,6 +145,12 @@ public:
 
   void MemcpyAsyncD2H(void* dst, const void* src, size_t count, cudaStream_t stream) {
     ErrorCheck("cudaMemcpyAsync", cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToHost, stream));
+  }
+
+  void ScaleBufferImpl(const void* fused_input_data, void* buffer_data, int64_t num_elements,
+                       double scale_factor, DataType dtype, cudaStream_t stream) {
+    ScaleBufferCudaImpl(fused_input_data, buffer_data, num_elements, scale_factor, dtype, stream);
+    ErrorCheck("ScaleBufferCudaImpl", cudaGetLastError());
   }
 
 private:

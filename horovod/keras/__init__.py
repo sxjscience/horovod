@@ -24,17 +24,18 @@ from horovod.tensorflow import rank
 from horovod.tensorflow import local_rank
 from horovod.tensorflow import mpi_threads_supported, mpi_enabled, mpi_built
 from horovod.tensorflow import gloo_enabled, gloo_built
-from horovod.tensorflow import nccl_built, ddl_built, ccl_built
+from horovod.tensorflow import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
 from horovod.tensorflow import Compression
 
-from horovod.keras import callbacks
+from horovod.keras import callbacks, elastic
 import horovod._keras as _impl
 
 
 def DistributedOptimizer(optimizer, name=None,
                          device_dense='', device_sparse='',
                          compression=Compression.none,
-                         sparse_as_dense=False):
+                         sparse_as_dense=False,
+                         gradient_predivide_factor=1.0):
     """
     An optimizer that wraps another keras.optimizers.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -45,9 +46,9 @@ def DistributedOptimizer(optimizer, name=None,
               gradients. Defaults to "Distributed" followed by the provided
               optimizer type.
         device_dense: Device to be used for dense tensors. Uses GPU by default
-                      if Horovod was build with HOROVOD_GPU_ALLREDUCE.
+                      if Horovod was build with HOROVOD_GPU_OPERATIONS.
         device_sparse: Device to be used for sparse tensors. Uses GPU by default
-                       if Horovod was build with HOROVOD_GPU_ALLGATHER.
+                       if Horovod was build with HOROVOD_GPU_OPERATIONS.
         compression: Compression algorithm used to reduce the amount of data
                      sent and received by each worker node.  Defaults to not
                      using compression.
@@ -55,10 +56,17 @@ def DistributedOptimizer(optimizer, name=None,
                          help improve performance and memory utilization if
                          the original sparse gradient has high density.
                          Defaults to false.
+        gradient_predivide_factor: gradient_predivide_factor splits the averaging
+                                   before and after the sum. Gradients are scaled by
+                                   1.0 / gradient_predivide_factor before the sum and
+                                   gradient_predivide_factor / size after the sum.
     """
+    if gradient_predivide_factor != 1.0 and rocm_built():
+            raise ValueError('gradient_predivide_factor not supported yet with ROCm')
+
     return _impl.create_distributed_optimizer(keras, optimizer, name,
                                               device_dense, device_sparse, compression,
-                                              sparse_as_dense)
+                                              sparse_as_dense, gradient_predivide_factor)
 
 
 def broadcast_global_variables(root_rank):
@@ -71,7 +79,7 @@ def broadcast_global_variables(root_rank):
     return _impl.broadcast_global_variables(K, root_rank)
 
 
-def allreduce(value, name=None, average=True):
+def allreduce(value, name=None, average=True, prescale_factor=1.0, postscale_factor=1.0):
     """
     Perform an allreduce on a tensor-compatible value.
 
@@ -81,8 +89,10 @@ def allreduce(value, name=None, average=True):
         name: Optional name for the constants created by this operation.
         average: If True, computes the average over all ranks.
                  Otherwise, computes the sum over all ranks.
+        prescale_factor: Multiplicative factor to scale tensor before allreduce.
+        postscale_factor: Multiplicative factor to scale tensor after allreduce.
     """
-    return _impl.allreduce(K, value, name, average)
+    return _impl.allreduce(K, value, name, average, prescale_factor, postscale_factor)
 
 
 def allgather(value, name=None):
@@ -147,4 +157,5 @@ def load_model(filepath, custom_optimizers=None, custom_objects=None, compressio
     """
     def wrap_optimizer(cls):
         return lambda **kwargs: DistributedOptimizer(cls(**kwargs), compression=compression)
-    return _impl.load_model(keras, wrap_optimizer, filepath, custom_optimizers, custom_objects)
+    optimizer_modules = {keras.optimizers.Optimizer.__module__}
+    return _impl.load_model(keras, wrap_optimizer, optimizer_modules, filepath, custom_optimizers, custom_objects)

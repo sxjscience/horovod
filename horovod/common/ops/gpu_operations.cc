@@ -44,7 +44,8 @@ void GPUOpContext::InitGPUQueue(const std::vector<TensorTableEntry>& entries, co
   }
 }
 
-Status GPUOpContext::FinalizeGPUQueue(const std::vector<TensorTableEntry>& entries, bool free_host_buffer /*= true*/) {
+Status GPUOpContext::FinalizeGPUQueue(const std::vector<TensorTableEntry>& entries, bool free_host_buffer /*= true*/,
+                                      const std::function<void()>& error_check_callback) {
   // Use completion marker via event because it's faster than
   // blocking gpuStreamSynchronize() in this thread.
   gpu_context_->RecordEvent(event_queue, "", *stream);
@@ -61,10 +62,10 @@ Status GPUOpContext::FinalizeGPUQueue(const std::vector<TensorTableEntry>& entri
       first_entry.device, first_entry.context->framework(), global_state_->current_nccl_stream);
 
   gpu_context_->finalizer_thread_pool.execute([entries, first_entry, cpu_buffer, fusion_buffer, free_host_buffer,
-                                                evt_queue, &timeline, &gpu_context]() mutable {
+                                                evt_queue, &timeline, &gpu_context, error_check_callback]() mutable {
     gpu_context->SetDevice(first_entry.device);
 
-    gpu_context->WaitForEvents(evt_queue, entries, timeline);
+    gpu_context->WaitForEvents(evt_queue, entries, timeline, error_check_callback);
     if (free_host_buffer && cpu_buffer != nullptr) {
       free(cpu_buffer);
     }
@@ -108,6 +109,13 @@ void GPUAllreduce::MemcpyEntryOutFusionBuffer(const std::vector<TensorTableEntry
                                gpu_context_->streams[global_state_->current_nccl_stream][first_entry.device]);
 }
 
+void GPUAllreduce::ScaleBuffer(double scale_factor, const std::vector<TensorTableEntry>& entries,
+                               const void* fused_input_data, void* buffer_data, int64_t num_elements) {
+  gpu_context_->ScaleBufferImpl(fused_input_data, buffer_data, num_elements, scale_factor, entries[0].tensor->dtype(),
+                                gpu_context_->streams[global_state_->current_nccl_stream][entries[0].device]);
+
+}
+
 GPUAllgather::GPUAllgather(GPUContext* context, HorovodGlobalState* global_state)
     : AllgatherOp(global_state), gpu_context_(context), gpu_op_context_(context, global_state) {}
 
@@ -139,6 +147,16 @@ GPUBroadcast::GPUBroadcast(GPUContext* context,
 bool GPUBroadcast::Enabled(const ParameterManager& param_manager,
                            const std::vector<TensorTableEntry>& entries,
                            const Response& response) const {
+  return entries[0].device != CPU_DEVICE_ID;
+}
+
+GPUAlltoall::GPUAlltoall(GPUContext* context,
+		         HorovodGlobalState* global_state)
+    : AlltoallOp(global_state), gpu_context_(context), gpu_op_context_(context, global_state) {}
+
+bool GPUAlltoall::Enabled(const ParameterManager& param_manager,
+                          const std::vector<TensorTableEntry>& entries,
+                          const Response& response) const {
   return entries[0].device != CPU_DEVICE_ID;
 }
 

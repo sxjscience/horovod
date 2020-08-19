@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
 from pyspark import keyword_only
@@ -90,6 +88,8 @@ class EstimatorParams(Params):
                               'function that applies custom transformations to '
                               'every batch before train and validation steps')
 
+    label_shapes = Param(Params._dummy(), 'label_shapes', 'specifies the shape (or shapes) of the label column (or columns)')
+
     def __init__(self):
         super(EstimatorParams, self).__init__()
 
@@ -119,7 +119,8 @@ class EstimatorParams(Params):
             validation_steps_per_epoch=None,
             transformation_fn=None,
             train_reader_num_workers=2,
-            val_reader_num_workers=2)
+            val_reader_num_workers=2,
+            label_shapes=None)
 
     def _check_params(self, metadata):
         model = self.getModel()
@@ -300,6 +301,12 @@ class EstimatorParams(Params):
     def getValReaderNumWorker(self):
         return self.getOrDefault(self.val_reader_num_workers)
 
+    def setLabelShapes(self, value):
+        return self._set(label_shapes=value)
+
+    def getLabelShapes(self):
+        return self.getOrDefault(self.label_shapes)
+
 
 class ModelParams(HasOutputCols):
     history = Param(Params._dummy(), 'history', 'history')
@@ -315,6 +322,10 @@ class ModelParams(HasOutputCols):
 
     def __init__(self):
         super(ModelParams, self).__init__()
+
+    # Only for internal use
+    def _get_metadata(self):
+        return self.getOrDefault(self._metadata)
 
     @keyword_only
     def setParams(self, **kwargs):
@@ -350,6 +361,14 @@ class ModelParams(HasOutputCols):
     def getRunId(self):
         return self.getOrDefault(self.run_id)
 
-    # Only for internal use
-    def _get_metadata(self):
-        return self.getOrDefault(self._metadata)
+    # copied from https://github.com/apache/spark/tree/master/python/pyspark/ml/param/shared.py
+    # has been removed from pyspark.ml.param.HasOutputCol in pyspark 3.0.0
+    # added here to keep ModelParams API consistent between pyspark 2 and 3
+    # https://github.com/apache/spark/commit/b19fd487dfe307542d65391fd7b8410fa4992698#diff-3d1fb305acc7bab18e5d91f2b69018c7
+    # https://github.com/apache/spark/pull/26232
+    # https://issues.apache.org/jira/browse/SPARK-29093
+    def setOutputCols(self, value):
+        """
+        Sets the value of :py:attr:`outputCols`.
+        """
+        return self._set(outputCols=value)

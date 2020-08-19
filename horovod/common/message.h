@@ -1,6 +1,7 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2019 Uber Technologies, Inc.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -47,8 +48,9 @@ std::size_t DataType_Size(DataType value);
 class Request {
 public:
   enum RequestType {
-    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4
+    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4, ALLTOALL = 5
   };
+
 
   static const std::string& RequestType_Name(RequestType value);
 
@@ -85,9 +87,18 @@ public:
 
   void add_tensor_shape(int64_t value);
 
+  double prescale_factor() const;
+
+  double postscale_factor() const;
+
+  void set_prescale_factor(const double prescale_factor);
+
+  void set_postscale_factor(const double postscale_factor);
+
   static void ParseFromBytes(Request& request, const uint8_t* input);
 
   static void SerializeToString(const Request& request, std::string& output);
+
 
 private:
   int32_t request_rank_ = 0;
@@ -97,6 +108,8 @@ private:
   int32_t device_ = 0;
   std::string tensor_name_;
   std::vector<int64_t> tensor_shape_;
+  double prescale_factor_ = 1.0;
+  double postscale_factor_ = 1.0;
 };
 
 class RequestList {
@@ -132,7 +145,7 @@ private:
 class Response {
 public:
   enum ResponseType {
-    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4, ERROR = 5
+    ALLREDUCE = 0, ALLGATHER = 1, BROADCAST = 2, JOIN = 3, ADASUM = 4, ALLTOALL= 5, ERROR = 6
   };
 
   static const std::string& ResponseType_Name(ResponseType value);
@@ -153,6 +166,8 @@ public:
   void set_tensor_names(const std::vector<std::string>& value);
 
   void add_tensor_name(const std::string& value);
+
+  void add_tensor_name(std::string&& value);
 
   // Empty unless response_type is ERROR.
   const std::string& error_message() const;
@@ -177,6 +192,14 @@ public:
   // To fuse multiple allgather responses
   void add_allgather_response(const Response& response);
 
+  double prescale_factor() const;
+
+  double postscale_factor() const;
+
+  void set_prescale_factor(const double prescale_factor);
+
+  void set_postscale_factor(const double postscale_factor);
+
   static void ParseFromBytes(Response& response, const uint8_t* input);
 
   static void SerializeToString(const Response& response,
@@ -189,6 +212,8 @@ private:
   std::string error_message_;
   std::vector<int32_t> devices_;
   std::vector<int64_t> tensor_sizes_;
+  double prescale_factor_ = 1.0;
+  double postscale_factor_ = 1.0;
 };
 
 class ResponseList {
@@ -198,6 +223,8 @@ public:
   void set_responses(const std::vector<Response>& value);
 
   void add_response(const Response& value);
+
+  void add_response(Response&& value);
 
   void emplace_response(Response&& value);
 

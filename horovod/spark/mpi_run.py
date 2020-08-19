@@ -13,14 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
-import os
+import copy
 import sys
 
-from horovod.run.mpi_run import mpi_run as hr_mpi_run
-from horovod.run.common.util import codec, safe_shell_exec, secret
+from horovod.runner.mpi_run import mpi_run as hr_mpi_run
+from horovod.runner.common.util import codec, secret
 
 
-def mpi_run(settings, nics, driver, env, stdout=None, stderr=None, run_func=None):
+def mpi_run(settings, nics, driver, env, stdout=None, stderr=None):
     """
     Runs mpirun.
 
@@ -28,22 +28,18 @@ def mpi_run(settings, nics, driver, env, stdout=None, stderr=None, run_func=None
                      Note: settings.num_proc and settings.hosts must not be None.
     :param nics: Interfaces to include by MPI.
     :param driver: The Spark driver service that tasks are connected to.
-    :param env: Environment dictionary to use for running MPI.
+    :param env: Environment dictionary to use for running MPI.  Can be None.
     :param stdout: Stdout of the mpi process.
                    Only used when settings.run_func_mode is True.
     :param stderr: Stderr of the mpi process.
                    Only used when settings.run_func_mode is True.
-    :param run_func: Run function to use. Must have arguments 'command' and 'env'.
-                     Only used when settings.run_func_mode is True.
-                     Defaults to safe_shell_exec.execute.
     """
-    if env is None:
-        env = os.environ.copy()
-    if run_func is None:
-        run_func = safe_shell_exec.execute
+    env = {} if env is None else copy.copy(env)  # copy env so we do not leak env modifications
 
     # Pass secret key through the environment variables.
     env[secret.HOROVOD_SECRET_KEY] = codec.dumps_base64(settings.key)
+    # we don't want the key to be serialized along with settings from here on
+    settings.key = None
 
     rsh_agent = (sys.executable,
                  '-m', 'horovod.spark.driver.mpirun_rsh',
@@ -56,4 +52,4 @@ def mpi_run(settings, nics, driver, env, stdout=None, stderr=None, run_func=None
                '-m', 'horovod.spark.task.mpirun_exec_fn',
                codec.dumps_base64(driver.addresses()),
                codec.dumps_base64(settings))
-    hr_mpi_run(settings, nics, env, command, stdout=stdout, stderr=stderr, run_func=run_func)
+    hr_mpi_run(settings, nics, env, command, stdout=stdout, stderr=stderr)

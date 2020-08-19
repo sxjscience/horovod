@@ -6,6 +6,14 @@
 Horovod
 =======
 
+.. raw:: html
+
+   <div align="center">
+
+.. image:: https://badge.fury.io/py/horovod.svg
+   :target: https://badge.fury.io/py/horovod
+   :alt: PyPI Version
+
 .. image:: https://badge.buildkite.com/6f976bc161c69d9960fc00de01b69deb6199b25680a09e5e26.svg?branch=master
    :target: https://buildkite.com/horovod/horovod
    :alt: Build Status
@@ -30,6 +38,10 @@ Horovod
    :target: https://pepy.tech/project/horovod
    :alt: Downloads
 
+.. raw:: html
+
+   </div>
+
 .. inclusion-marker-start-do-not-remove
 
 |
@@ -52,21 +64,20 @@ about who's involved and how Horovod plays a role, read the LF AI `announcement 
 
 .. contents::
 
-
-The full documentation and an API reference are published at https://horovod.readthedocs.io/en/latest.
-
 |
 
-Why not traditional distributed TensorFlow?
--------------------------------------------
-The primary motivation for this project is to make it easy to take a single-GPU TensorFlow program and successfully train
-it on many GPUs faster. This has two aspects:
+Why Horovod?
+------------
+The primary motivation for this project is to make it easy to take a single-GPU training script and successfully scale
+it to train across many GPUs in parallel. This has two aspects:
 
 1. How much modification does one have to make to a program to make it distributed, and how easy is it to run it?
 2. How much faster would it run in distributed mode?
 
-Internally at Uber we found the MPI model to be much more straightforward and require far less code changes than the
-Distributed TensorFlow with parameter servers. See the `Usage <#usage>`__ section for more details.
+Internally at Uber we found the MPI model to be much more straightforward and require far less code changes than previous
+solutions such as Distributed TensorFlow with parameter servers. Once a training script has been written for scale with
+Horovod, it can run on a single-GPU, multiple-GPUs, or even multiple hosts without any further code changes.
+See the `Usage <#usage>`__ section for more details.
 
 In addition to being easy to use, Horovod is fast. Below is a chart representing the benchmark that was done on 128
 servers with 4 Pascal GPUs each connected by RoCE-capable 25 Gbit/s network:
@@ -116,13 +127,15 @@ To install Horovod:
 
    .. code-block:: bash
 
-      $ HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL pip install horovod
+      $ HOROVOD_GPU_OPERATIONS=NCCL pip install horovod
 
 This basic installation is good for laptops and for getting to know Horovod.
 
 For more details on installing Horovod with GPU support, read `Horovod on GPU <gpus.rst>`_.
 
 For the full list of Horovod installation options, read the `Installation Guide <install.rst>`_.
+
+If you want to use Conda, read `Building a Conda environment with GPU support for Horovod <conda.rst>`_.
 
 If you want to use Docker, read `Horovod in Docker <docker.rst>`_.
 
@@ -145,19 +158,18 @@ See these pages for Horovod examples and best practices:
 
 Usage
 -----
-.. inclusion-marker-tensorflow-start-do-not-remove
 
-To use Horovod, make the following additions to your program. This example uses TensorFlow.
+To use Horovod, make the following additions to your program:
 
-1. Run ``hvd.init()``.
+1. Run ``hvd.init()`` to initialize Horovod.
 
 .. raw:: html
 
     <p/>
 
-2. Pin a server GPU to be used by this process using ``config.gpu_options.visible_device_list``.
+2. Pin each GPU to a single process to avoid resource contention.
 
-   With the typical setup of one GPU per process, you can set this to *local rank*. In that case, the first process on
+   With the typical setup of one GPU per process, set this to *local rank*. The first process on
    the server will be allocated the first GPU, the second process will be allocated the second GPU, and so forth.
 
 .. raw:: html
@@ -184,10 +196,9 @@ To use Horovod, make the following additions to your program. This example uses 
     <p/>
 
 
-5. Add ``hvd.BroadcastGlobalVariablesHook(0)`` to broadcast initial variable states from rank 0 to all other processes.
+5. Broadcast the initial variable states from rank 0 to all other processes.
 
    This is necessary to ensure consistent initialization of all workers when training is started with random weights or restored from a checkpoint.
-   Alternatively, if you're not using ``MonitoredTrainingSession``, you can execute the ``hvd.broadcast_global_variables`` op after global variables have been initialized.
 
 .. raw:: html
 
@@ -196,14 +207,12 @@ To use Horovod, make the following additions to your program. This example uses 
 
 6. Modify your code to save checkpoints only on worker 0 to prevent other workers from corrupting them.
 
-   Accomplish this by passing ``checkpoint_dir=None`` to ``tf.train.MonitoredTrainingSession`` if ``hvd.rank() != 0``.
-
 .. raw:: html
 
     <p/>
 
 
-Example (see the `examples <https://github.com/horovod/horovod/blob/master/examples/>`_ directory for full training examples):
+Example using TensorFlow v1 (see the `examples <https://github.com/horovod/horovod/blob/master/examples/>`_ directory for full training examples):
 
 .. code-block:: python
 
@@ -245,7 +254,6 @@ Example (see the `examples <https://github.com/horovod/horovod/blob/master/examp
         # Perform synchronous training.
         mon_sess.run(train_op)
 
-.. inclusion-marker-tensorflow-end-do-not-remove
 
 Running Horovod
 ---------------
@@ -268,7 +276,7 @@ See `Run Horovod <running.rst>`_ for more details, including RoCE/InfiniBand twe
 
 4. To run in Docker, see `Horovod in Docker <docker.rst>`_.
 
-5. To run in Kubernetes, see `Kubeflow <https://github.com/kubeflow/examples/tree/master/demos/yelp_demo/ks_app/vendor/kubeflow/mpi-job>`_, `MPI Operator <https://github.com/kubeflow/mpi-operator/>`_, `Helm Chart <https://github.com/kubernetes/charts/tree/master/stable/horovod/>`_, and `FfDL <https://github.com/IBM/FfDL/tree/master/etc/examples/horovod/>`_.
+5. To run in Kubernetes, see `Kubeflow <https://github.com/kubeflow/examples/tree/master/demos/yelp_demo/ks_app/vendor/kubeflow/mpi-job>`_, `MPI Operator <https://github.com/kubeflow/mpi-operator/>`_, `Helm Chart <https://github.com/kubernetes/charts/tree/master/stable/horovod/>`_, `FfDL <https://github.com/IBM/FfDL/tree/master/etc/examples/horovod/>`_, and `Polyaxon <https://docs.polyaxon.com/integrations/horovod/>`_.
 
 6. To run in Spark, see `Spark <spark.rst>`_.
 
@@ -365,6 +373,7 @@ See `here <autotune.rst>`__ for full details and usage instructions.
 Guides
 ------
 1. Run distributed training in Microsoft Azure using `Batch AI and Horovod <https://github.com/Azure/BatchAI/tree/master/recipes/Horovod>`_.
+2. `Distributed model training using Horovod <https://spell.ml/blog/distributed-model-training-using-horovod-XvqEGRUAACgAa5th>`_.
 
 Send us links to any user guides you want to publish on this site
 

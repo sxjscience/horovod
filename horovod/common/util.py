@@ -15,10 +15,14 @@
 # limitations under the License.
 # =============================================================================
 
-from contextlib import contextmanager
-from multiprocessing import Process, Queue
+import multiprocessing
 import os
+import sys
 import sysconfig
+import warnings
+
+from contextlib import contextmanager
+
 
 EXTENSIONS = ['tensorflow', 'torch', 'mxnet']
 
@@ -47,8 +51,11 @@ def check_extension(ext_name, ext_env_var, pkg_path, *args):
     full_path = get_extension_full_path(pkg_path, *args)
     if not os.path.exists(full_path):
         raise ImportError(
-            'Extension %s has not been built.  If this is not expected, reinstall '
-            'Horovod with %s=1 to debug the build error.' % (ext_name, ext_env_var))
+            'Extension {} has not been built: {} not found\n'
+            'If this is not expected, reinstall Horovod with {}=1 to debug the build error.'.format(
+                ext_name, full_path, ext_env_var
+            )
+        )
 
 
 def _check_extension_lambda(ext_base_name, fn, fn_desc, verbose):
@@ -83,9 +90,11 @@ def _check_extension_lambda(ext_base_name, fn, fn_desc, verbose):
 
         queue.put(result)
 
-    queue = Queue()
-    p = Process(target=_target_fn,
-                args=(ext_base_name, fn, fn_desc, queue, verbose))
+    # 'fork' is required because horovodrun is a frozen executable
+    ctx = multiprocessing.get_context('fork')
+    queue = ctx.Queue()
+    p = ctx.Process(target=_target_fn,
+                    args=(ext_base_name, fn, fn_desc, queue, verbose))
     p.daemon = True
     p.start()
     p.join()
@@ -220,6 +229,8 @@ def get_average_backwards_compatibility_fun(reduce_ops):
                 raise ValueError('The op parameter supersedes average. Please provide only one of them.')
             return op
         elif average != None:
+            warnings.warn('Parameter `average` has been replaced with `op` and will be removed in v0.21.0',
+                          DeprecationWarning)
             return reduce_ops.Average if average else reduce_ops.Sum
         else:
             return reduce_ops.Average

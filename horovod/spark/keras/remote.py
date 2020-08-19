@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import contextlib
 import io
 import math
@@ -26,7 +24,7 @@ import tensorflow as tf
 from distutils.version import LooseVersion
 
 from horovod.spark.common import constants
-from horovod.run.common.util import codec
+from horovod.runner.common.util import codec
 
 
 PETASTORM_HDFS_DRIVER = constants.PETASTORM_HDFS_DRIVER
@@ -48,6 +46,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     should_validate = estimator.getValidation()
     user_shuffle_buffer_size = estimator.getShufflingBufferSize()
     user_verbose = estimator.getVerbose()
+    checkpoint_callback = estimator.getCheckpointCallback()
 
     # Data reader parameters
     train_reader_worker_count = estimator.getTrainReaderNumWorker()
@@ -56,6 +55,7 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     # Model parameters
     input_shapes, output_shapes = estimator.get_model_shapes()
     output_names = estimator.getModel().output_names
+    label_shapes = estimator.getLabelShapes()
 
     # Keras implementation
     keras_module = keras_utils.keras()
@@ -63,8 +63,14 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
     get_horovod = keras_utils.horovod_fn()
     get_keras = keras_utils.keras_fn()
     make_dataset = keras_utils.make_dataset_fn(
-        feature_columns, label_columns, sample_weight_col, metadata,
-        input_shapes, output_shapes, output_names, batch_size)
+        feature_columns=feature_columns,
+        label_columns=label_columns,
+        sample_weight_col=sample_weight_col,
+        metadata=metadata,
+        input_shapes=input_shapes,
+        label_shapes=label_shapes if label_shapes else output_shapes,
+        output_names=output_names,
+        batch_size=batch_size)
     fit = keras_utils.fit_fn(epochs)
     transformation_fn = estimator.getTransformationFn()
     transformation = transformation_fn if transformation_fn else None
@@ -142,7 +148,15 @@ def RemoteTrainer(estimator, metadata, keras_utils, run_id, dataset_idx):
                 ckpt_file = os.path.join(run_output_dir, remote_store.checkpoint_filename)
                 logs_dir = os.path.join(run_output_dir, remote_store.logs_subdir)
 
-                callbacks.append(k.callbacks.ModelCheckpoint(ckpt_file))
+                # This callback checkpoints the model that ultimately is wrapped and returned after
+                # Estimator.fit is called.
+                _checkpoint_callback = checkpoint_callback
+                if _checkpoint_callback:
+                    _checkpoint_callback.filepath = ckpt_file
+                else:
+                    _checkpoint_callback = k.callbacks.ModelCheckpoint(ckpt_file)
+                callbacks.append(_checkpoint_callback)
+
                 if remote_store.saving_runs:
                     callbacks.append(k.callbacks.TensorBoard(logs_dir))
                     callbacks.append(SyncCallback(run_output_dir, remote_store.sync, k))
@@ -263,7 +277,7 @@ def _calculate_shuffle_buffer_size_fn():
         """
         local_size = hvd.local_size()
         local_sizes = hvd.allgather([local_size])
-        max_local_size = max(local_sizes)
+        max_local_size = int(max(local_sizes))
 
         if max_local_size > TOTAL_BUFFER_MEMORY_CAP_GIB:
             shuffle_buffer_size = TOTAL_BUFFER_MEMORY_CAP_GIB * BYTES_PER_GIB / avg_row_size / max_local_size

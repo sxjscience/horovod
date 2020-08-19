@@ -1,4 +1,5 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Modifications copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 # Load all the necessary MXNet C types.
 import ctypes
@@ -43,13 +40,16 @@ gloo_built = _basics.gloo_built
 nccl_built = _basics.nccl_built
 ddl_built = _basics.ddl_built
 ccl_built = _basics.ccl_built
+cuda_built = _basics.cuda_built
+rocm_built = _basics.rocm_built
 
 dll_path = os.path.join(os.path.dirname(__file__),
                         'mpi_lib' + get_ext_suffix())
 MPI_MXNET_LIB_CTYPES = ctypes.CDLL(dll_path, ctypes.RTLD_GLOBAL)
 
 
-def allreduce(tensor, average=True, name=None, priority=0):
+def allreduce(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
+              postscale_factor=1.0):
     """
     A function that performs averaging or summation of the input tensor over
     all the Horovod processes. The input tensor is not modified.
@@ -70,6 +70,8 @@ def allreduce(tensor, average=True, name=None, priority=0):
         name: A name of the reduction operation.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
+        prescale_factor: Multiplicative factor to scale tensor before allreduce
+        postscale_factor: Multiplicative factor to scale tensor after allreduce
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed
@@ -82,16 +84,21 @@ def allreduce(tensor, average=True, name=None, priority=0):
     if isinstance(name, string_types):
         check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
             c_in, c_out, c_str(name), ctypes.c_bool(average),
-            ctypes.c_int(priority)))
+            ctypes.c_int(priority),
+            ctypes.c_double(prescale_factor),
+            ctypes.c_double(postscale_factor)))
     else:
         check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
             c_in, c_out, name, ctypes.c_bool(average),
-            ctypes.c_int(priority)))
+            ctypes.c_int(priority),
+            ctypes.c_double(prescale_factor),
+            ctypes.c_double(postscale_factor)))
 
     return output
 
 
-def allreduce_(tensor, average=True, name=None, priority=0):
+def allreduce_(tensor, average=True, name=None, priority=0, prescale_factor=1.0,
+              postscale_factor=1.0):
     """
     A function that performs in-place averaging or summation of the input
     tensor over all the Horovod processes.
@@ -108,6 +115,8 @@ def allreduce_(tensor, average=True, name=None, priority=0):
         name: A name of the reduction operation.
         priority: The priority of this operation. Higher priority operations
                   are likely to be executed before other operations.
+        prescale_factor: Multiplicative factor to scale tensor before allreduce
+        postscale_factor: Multiplicative factor to scale tensor after allreduce
 
     Returns:
         A tensor of the same shape and type as `tensor`, averaged or summed
@@ -118,11 +127,15 @@ def allreduce_(tensor, average=True, name=None, priority=0):
     if isinstance(name, string_types):
         check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
             c_in, c_out, c_str(name), ctypes.c_bool(average),
-            ctypes.c_int(priority)))
+            ctypes.c_int(priority),
+            ctypes.c_double(prescale_factor),
+            ctypes.c_double(postscale_factor)))
     else:
         check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allreduce_async(
             c_in, c_out, name, ctypes.c_bool(average),
-            ctypes.c_int(priority)))
+            ctypes.c_int(priority),
+            ctypes.c_double(prescale_factor),
+            ctypes.c_double(postscale_factor)))
     return tensor
 
 
@@ -134,10 +147,6 @@ def allgather(tensor, name=None, priority=0):
     The concatenation is done on the first dimension, so the input tensors on
     the different processes must have the same rank and shape, except for the
     first dimension, which is allowed to be different.
-
-    This acts as a thin wrapper around an autograd function.  If your input
-    tensor requires gradients, then callings this function will allow gradients
-    to be computed and backpropagated.
 
     Arguments:
         tensor: A tensor to allgather.
@@ -152,7 +161,9 @@ def allgather(tensor, name=None, priority=0):
         first dimensions of the tensors in different Horovod processes.
     """
     assert(isinstance(tensor, mx.nd.NDArray))
-    output = mx.nd.zeros(shape=tensor.shape, ctx=tensor.context,
+    # Size of output is unknown, create output array that
+    # will be resized during Horovod operation
+    output = mx.nd.empty(shape=[1], ctx=tensor.context,
                          dtype=tensor.dtype)
     c_in = tensor.handle
     c_out = output.handle
@@ -162,6 +173,9 @@ def allgather(tensor, name=None, priority=0):
     else:
         check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_allgather_async(
             c_in, c_out, name, ctypes.c_int(priority)))
+
+    # Need to block here so changes to output tensor are visible
+    output.wait_to_read()
     return output
 
 
@@ -240,3 +254,53 @@ def broadcast_(tensor, root_rank, name=None, priority=0):
             c_in, c_out, name, ctypes.c_int(root_rank),
             ctypes.c_int(priority)))
     return tensor
+
+def alltoall(tensor, splits=None, name=None, priority=0):
+    """
+    A function that scatters slices of the input tensor to all other Horovod processes
+    and returns a tensor of gathered slices from all other Horovod processes. The input
+    tensor is not modified.
+
+    The slicing is done on the first dimension, so the input tensors on
+    the different processes must have the same rank and shape, except for the
+    first dimension, which is allowed to be different.
+
+    Arguments:
+        tensor: A tensor to distribute with alltoall.
+        splits: A tensor of integers in rank order describing how many
+                elements in `tensor` to send to each worker.  Splitting is
+                applied along the first dimension of `tensor`. If `splits` is
+                not provided, the first dimension is split equally by the
+                number of Horovod processes.
+        name: A name of the alltoall operation.
+        priority: The priority of this operation. Higher priority operations
+                  are likely to be executed before other operations.
+
+    Returns:
+        A tensor containing the gathered tensor data from all workers.
+    """
+    assert(isinstance(tensor, mx.nd.NDArray))
+
+    if splits is None:
+        # If splits not provided, create empty tensor as placeholder
+        splits = mx.nd.array([], ctx=mx.cpu(), dtype='int32')
+    elif not isinstance(splits, mx.nd.NDArray):
+        splits = mx.nd.array(splits, ctx=mx.cpu(), dtype='int32')
+
+    # Size of output is unknown, create output array that
+    # will be resized during Horovod operation
+    output = mx.nd.empty(shape=[1], ctx=tensor.context,
+                         dtype=tensor.dtype)
+    c_in = tensor.handle
+    c_out = output.handle
+    c_splits = splits.handle
+    if isinstance(name, string_types):
+        check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_alltoall_async(
+            c_in, c_out, c_str(name), c_splits, ctypes.c_int(priority)))
+    else:
+        check_call(MPI_MXNET_LIB_CTYPES.horovod_mxnet_alltoall_async(
+            c_in, c_out, name, c_splits, ctypes.c_int(priority)))
+
+    # Need to block here so changes to output tensor are visible
+    output.wait_to_read()
+    return output

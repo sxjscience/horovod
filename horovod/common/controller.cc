@@ -1,5 +1,6 @@
 // Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
 // Modifications copyright Microsoft
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -138,15 +139,16 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     // Remove uncommon cached tensors from queue and replace to state
     // queue for next cycle. Skip adding common cached tensors to
     // queue as they are handled separately.
+    std::deque<Request> messages_to_replace;
     size_t num_messages = message_queue_tmp.size();
     for (size_t i = 0; i < num_messages; ++i) {
-      auto message = message_queue_tmp.front();
+      auto& message = message_queue_tmp.front();
       if (response_cache_.cached(message) == ResponseCache::CacheState::HIT) {
         uint32_t cache_bit = response_cache_.peek_cache_bit(message);
         if (cache_coordinator.cache_hits().find(cache_bit) ==
             cache_coordinator.cache_hits().end()) {
           // Try to process again in next cycle.
-          tensor_queue_.PushMessageToQueue(message);
+          messages_to_replace.push_back(std::move(message));
         } else {
           // Remove timing entry for messages being handled this cycle.
           stall_inspector_.RemoveCachedTensor(message.tensor_name());
@@ -158,10 +160,11 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
       }
       message_queue_tmp.pop_front();
     }
+    tensor_queue_.PushMessagesToQueue(messages_to_replace);
   }
 
   if (!message_queue_tmp.empty()) {
-    LOG(DEBUG, rank_) << "Sent " << message_queue_tmp.size()
+    LOG(TRACE, rank_) << "Sent " << message_queue_tmp.size()
                       << " messages to coordinator.";
   }
 
@@ -340,7 +343,8 @@ ResponseList Controller::ComputeResponseList(std::atomic_bool& shut_down,
     // order consistently across workers.
     for (auto& response : response_list.responses()) {
       if ((response.response_type() == Response::ResponseType::ALLREDUCE ||
-           response.response_type() == Response::ResponseType::ADASUM) &&
+           response.response_type() == Response::ResponseType::ADASUM ||
+           response.response_type() == Response::ResponseType::ALLTOALL) &&
           (int)response.devices().size() == size_) {
         response_cache_.put(response, tensor_queue_, state.joined);
       }
@@ -383,7 +387,7 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
 
   std::ostringstream error_message_stream;
 
-  // Check that all data types of tensors being reduced, gathered or broadcasted
+  // Check that all data types of tensors being processed
   // are identical.
   auto data_type = requests[0].tensor_type();
   for (unsigned int i = 1; i < requests.size(); ++i) {
@@ -447,17 +451,52 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
     }
   }
 
+  // If we are doing an allreduce, check that prescaling and postscaling factors
+  // are identical across ranks.
+  double prescale_factor;
+  double postscale_factor;
+  if (message_type == Request::ALLREDUCE ||
+      message_type == Request::ADASUM) {
+    prescale_factor = requests[0].prescale_factor();
+    postscale_factor = requests[0].postscale_factor();
+
+    for (unsigned int i = 1; i < requests.size(); ++i) {
+      if (error) {
+        break;
+      }
+      double request_prescale_factor = requests[i].prescale_factor();
+      double request_postscale_factor = requests[i].postscale_factor();
+
+      if (prescale_factor != request_prescale_factor ||
+          postscale_factor != request_postscale_factor) {
+        error = true;
+        error_message_stream
+            << "Mismatched prescale and/or postscale factors: "
+            << "One rank sent factors (" << prescale_factor
+            << ", " << postscale_factor << "), but another rank "
+            << "sent factors (" << request_prescale_factor
+            << ", " << request_postscale_factor << ").";
+        break;
+      }
+    }
+  }
+
   std::vector<int64_t> tensor_sizes;
-  if (message_type == Request::ALLGATHER) {
+  if (message_type == Request::ALLGATHER ||
+      message_type == Request::ALLTOALL) {
     if (joined_size > 0) {
       error = true;
-      error_message_stream << "Allgather is not supported with Join at this time. "
-                           << "Specify sparse_to_dense=True if using DistributedOptimizer";
+      if (message_type == Request::ALLGATHER) {
+        error_message_stream << "Allgather is not supported with Join at this time. "
+                             << "Specify sparse_to_dense=True if using DistributedOptimizer";
+      } else if (message_type == Request::ALLTOALL) {
+        error_message_stream << "Alltoall is not supported with Join at this time.";
+      }
     }
 
-    // If we are doing an allgather, make sure all but the first dimension are
+    // If we are doing an allgather/alltoall, make sure all but the first dimension are
     // the same. The first dimension may be different and the output tensor is
-    // the sum of the first dimension. Collect the sizes by rank.
+    // the sum of the first dimension. Collect the sizes by rank for allgather only.
     tensor_sizes.resize(requests.size());
     TensorShape tensor_shape;
     for (auto dim : requests[0].tensor_shape()) {
@@ -511,7 +550,10 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
         break;
       }
 
-      tensor_sizes[requests[i].request_rank()] = request_shape.dim_size(0);
+      // Collect first dimension sizes for allgather to use for fusion and allgather op.
+      if (message_type == Request::ALLGATHER) {
+        tensor_sizes[requests[i].request_rank()] = request_shape.dim_size(0);
+      }
     }
   }
 
@@ -589,14 +631,20 @@ Response Controller::ConstructResponse(std::string& name, int joined_size) {
       response.add_tensor_size(dim);
     }
     response.set_tensor_type(data_type);
+    response.set_prescale_factor(prescale_factor);
+    response.set_postscale_factor(postscale_factor);
   } else if (message_type == Request::BROADCAST) {
     response.set_response_type(Response::BROADCAST);
+  } else if (message_type == Request::ALLTOALL) {
+    response.set_response_type(Response::ALLTOALL);
   } else if (message_type == Request::ADASUM) {
     response.set_response_type(Response::ADASUM);
     for (auto dim : tensor_sizes) {
       response.add_tensor_size(dim);
     }
     response.set_tensor_type(data_type);
+    response.set_prescale_factor(prescale_factor);
+    response.set_postscale_factor(postscale_factor);
   }
   response.set_devices(devices);
 
@@ -651,7 +699,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       std::deque<Response> skipped_responses;
       int64_t skipped_size = 0;
       while (!responses.empty()) {
-        auto new_response = responses.front();
+        auto& new_response = responses.front();
         assert(new_response.tensor_names().size() == 1);
 
         int64_t new_tensor_size = new_response.tensor_sizes().empty()
@@ -661,10 +709,12 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
         if (response.response_type() == new_response.response_type() &&
             response.devices() == new_response.devices() &&
             response.tensor_type() == new_response.tensor_type() &&
-            tensor_size + new_tensor_size <= TensorFusionThresholdBytes()) {
+            tensor_size + new_tensor_size <= TensorFusionThresholdBytes() &&
+            response.prescale_factor() == new_response.prescale_factor() &&
+            response.postscale_factor() == new_response.postscale_factor()) {
           // These tensors will fuse together well.
           tensor_size += new_tensor_size;
-          response.add_tensor_name(new_response.tensor_names()[0]);
+          response.add_tensor_name(std::move(new_response.tensor_names()[0]));
           response.add_tensor_size(new_response.tensor_sizes()[0]);
           responses.pop_front();
         } else {
@@ -679,7 +729,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
           skipped_size += new_tensor_size;
           if (tensor_size + skipped_size <= TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
-            skipped_responses.push_back(std::move(responses.front()));
+            skipped_responses.push_back(std::move(new_response));
             responses.pop_front();
           } else {
             break;
@@ -705,7 +755,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       int64_t skipped_size = 0;
       while (!responses.empty()) {
 
-        auto new_response = responses.front();
+        auto& new_response = responses.front();
         assert(new_response.tensor_names().size() == 1);
         const auto& new_entry =
             tensor_queue_.GetTensorEntry(new_response.tensor_names()[0]);
@@ -737,7 +787,7 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
           if (total_byte_size_of_output + skipped_size <=
               TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
-            skipped_responses.push_back(std::move(responses.front()));
+            skipped_responses.push_back(std::move(new_response));
             responses.pop_front();
           } else {
             break;
@@ -752,8 +802,8 @@ ResponseList Controller::FuseResponses(std::deque<Response>& responses) {
       }
     }
 
-    response_list.add_response(response);
-    LOG(DEBUG) << "Created response of size " << tensor_size;
+    response_list.add_response(std::move(response));
+    LOG(TRACE) << "Created response of size " << tensor_size;
   }
   return response_list;
 }

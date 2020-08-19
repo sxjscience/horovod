@@ -13,33 +13,42 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import copy
-import os
+import io
 import itertools
+import os
+import subprocess
+import sys
+import threading
+import time
 import unittest
 import warnings
 
+import psutil
 import pytest
-from mock import MagicMock, patch
+import mock
 
-from horovod.run.common.util import config_parser, secret, settings as hvd_settings, timeout
-from horovod.run.common.util.host_hash import _hash, host_hash
-from horovod.run.mpi_run import _get_mpi_implementation, _get_mpi_implementation_flags,\
+from mock import MagicMock
+
+import horovod
+from horovod.runner.common.util import config_parser, hosts, safe_shell_exec, secret, \
+    settings as hvd_settings, timeout
+from horovod.runner import _HorovodArgs
+from horovod.runner.common.util.host_hash import _hash, host_hash
+from horovod.runner.gloo_run import gloo_run
+from horovod.runner.js_run import js_run, generate_jsrun_rankfile
+from horovod.runner.mpi_run import _get_mpi_implementation, _get_mpi_implementation_flags,\
     _LARGE_CLUSTER_THRESHOLD as large_cluster_threshold, mpi_available, mpi_run,\
     _OMPI_IMPL, _SMPI_IMPL, _MPICH_IMPL, _UNKNOWN_IMPL, _MISSING_IMPL
-from horovod.run.runner import parse_args, parse_host_files, run_controller
-from horovod.run.js_run import js_run, generate_jsrun_rankfile
+from horovod.runner.launch import gloo_built, parse_args, run_controller, _run
+from horovod.runner.util.threads import in_thread, on_event
 
-from common import is_built, lsf_and_jsrun, override_args, override_env, temppath
+from common import is_built, lsf_and_jsrun, override_args, override_env, temppath, delay, wait
 
 
 class RunTests(unittest.TestCase):
     """
-    Tests for horovod.run.
+    Tests for horovod.runner.
     """
 
     def __init__(self, *args, **kwargs):
@@ -212,22 +221,218 @@ class RunTests(unittest.TestCase):
             with pytest.raises(ValueError):
                 parse_args()
 
+    # test_on_event tests in_thread as well, but it does not test args
+    def test_in_thread_args(self):
+        fn = mock.Mock()
+        thread = in_thread(fn, args=(1,))
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once_with(1)
+
+        fn = mock.Mock()
+        thread = in_thread(fn, args=(1, 2))
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once_with(1, 2)
+
+        fn = mock.Mock()
+        thread = in_thread(fn, args=(1, 2), silent=True)
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once_with(1, 2)
+
+        fn = mock.Mock()
+        with pytest.raises(ValueError, match="^args must be a tuple, not <(class|type) 'int'>, "
+                                             "for a single argument use \\(arg,\\)$"):
+            in_thread(fn, args=1)
+        fn.assert_not_called()
+
+    def test_on_event(self):
+        # a happy run without args and stop event
+        event = threading.Event()
+        fn = mock.Mock()
+        thread = on_event(event, fn)
+        fn.assert_not_called()
+        event.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once()
+
+        # a happy run with args but without stop event
+        event = threading.Event()
+        fn = mock.Mock()
+        thread = on_event(event, fn, ('a', 1))
+        fn.assert_not_called()
+        event.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once()
+        fn.assert_called_once_with('a', 1)
+
+        # a happy run with stop event but unused
+        event = threading.Event()
+        stop = threading.Event()
+        fn = mock.Mock()
+        thread = on_event(event, fn, stop=stop, check_stop_interval_s=0.01)
+        fn.assert_not_called()
+        event.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once()
+        stop.set()
+        time.sleep(0.1)
+        fn.assert_called_once()
+
+        # stop the thread before we set the event
+        event = threading.Event()
+        stop = threading.Event()
+        fn = mock.Mock()
+        thread = on_event(event, fn, stop=stop, check_stop_interval_s=0.01)
+        fn.assert_not_called()
+        stop.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_not_called()
+        event.set()
+        time.sleep(0.1)
+        fn.assert_not_called()
+
+        # test with exception
+        def exception():
+            raise Exception("Test Exception")
+
+        event = threading.Event()
+        fn = mock.Mock(side_effect=exception)
+        thread = on_event(event, fn)
+        fn.assert_not_called()
+        event.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once()
+
+        # test with exception but silent
+        event = threading.Event()
+        fn = mock.Mock(side_effect=exception)
+        thread = on_event(event, fn)
+        fn.assert_not_called()
+        event.set()
+        thread.join(1.0)
+        self.assertFalse(thread.is_alive())
+        fn.assert_called_once()
+
+        # test None event
+        event = None
+        fn = mock.Mock()
+        with pytest.raises(ValueError, match="^Event must not be None$"):
+            on_event(event, fn)
+        fn.assert_not_called()
+
+        # test non-tuple args
+        event = threading.Event()
+        fn = mock.Mock()
+        with pytest.raises(ValueError, match="^args must be a tuple, not <(class|type) 'int'>, "
+                                             "for a single argument use \\(arg,\\)$"):
+            on_event(event, fn, args=1)
+        fn.assert_not_called()
+
+        # test None stop and non-daemon
+        event = threading.Event()
+        fn = mock.Mock()
+        with pytest.raises(ValueError, match="^Stop event must be given for non-daemon event thread$"):
+            on_event(event, fn, stop=None, daemon=False)
+        fn.assert_not_called()
+
+    def test_safe_shell_exec_captures_stdout(self):
+        self.do_test_safe_shell_exec('echo hello', 0, 'hello\n', '')
+
+    def test_safe_shell_exec_captures_stderr(self):
+        self.do_test_safe_shell_exec('echo hello >&2', 0, '', 'hello\n')
+
+    def test_safe_shell_exec_captures_last_line_wo_eol(self):
+        cmd = 'bash -c "echo -e -n \\"hello\nstdout\\"; echo -e -n \\"hello\nstderr\\" >&2"'
+        self.do_test_safe_shell_exec(cmd, 0, 'hello\nstdout', 'hello\nstderr')
+
+    def test_safe_shell_exec_returns_exit_code(self):
+        self.do_test_safe_shell_exec('false', 1, '', '')
+
+    def test_safe_shell_exec_interrupts_on_event(self):
+        # interrupt execute in one second
+        interrupt = threading.Event()
+        interrupt_delay = 1.0
+        delay(lambda: interrupt.set(), interrupt_delay)
+
+        sleep = interrupt_delay + safe_shell_exec.GRACEFUL_TERMINATION_TIME_S + 2.0
+        start = time.time()
+        self.do_test_safe_shell_exec('sleep {}'.format(sleep), 143, '', None, interrupt)
+        duration = time.time() - start
+
+        self.assertGreaterEqual(duration, interrupt_delay)
+        self.assertLess(duration, sleep - 1.0, 'sleep should not finish')
+
+    def test_safe_shell_exec_interrupts_on_parent_shutdown(self):
+        sleep = 20
+        parent_script = os.path.join(os.path.dirname(__file__), 'data/run_safe_shell_exec.py')
+        child_script = os.path.join(os.path.dirname(__file__), 'data/sleep.py')
+
+        def get_pid(logfile):
+            # Wait until the script has written its PID to the logfile
+            wait(lambda: os.path.exists(logfile), timeout=5)
+            with open(logfile, 'r') as f:
+                return int(f.read())
+
+        with temppath() as parent_logfile, temppath() as child_logfile:
+            # It's important that this executes in an entirely different interpreter with as little shared
+            # state as possible, to avoid issues with the semaphore tracker.
+            cmd = ' '.join([sys.executable, parent_script, parent_logfile, child_script, str(sleep), child_logfile])
+            p = subprocess.Popen(cmd, shell=True)
+
+            parent = psutil.Process(get_pid(parent_logfile))
+            child = psutil.Process(get_pid(child_logfile))
+
+            self.assertTrue(parent.is_running())
+            self.assertTrue(child.is_running())
+
+            # Hard kill the parent process
+            parent.kill()
+            parent.wait(timeout=safe_shell_exec.GRACEFUL_TERMINATION_TIME_S)
+            p.wait()
+
+            # Child process will exit when pipe breaks
+            child.wait(timeout=2 * safe_shell_exec.GRACEFUL_TERMINATION_TIME_S + 1)
+
+            self.assertFalse(parent.is_running())
+            self.assertFalse(child.is_running())
+
+    def do_test_safe_shell_exec(self, cmd, expected_exit_code, expected_stdout, expected_stderr, event=None):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        res = safe_shell_exec.execute(cmd, stdout=stdout, stderr=stderr, events=[event] if event else None)
+        self.assertEqual(expected_exit_code, res)
+        if expected_stdout is not None:
+            self.assertEqual(expected_stdout, stdout.getvalue())
+        if expected_stderr is not None:
+            self.assertEqual(expected_stderr, stderr.getvalue())
+
     def test_hash(self):
         hash = _hash("test string")
         self.assertEqual(hash, '6f8db599de986fab7a21625b7916589c')
 
     def test_host_hash(self):
         hash = host_hash()
-        # host_hash should consider CONTAINER_ID environment variable
-        with override_env({'CONTAINER_ID': 'a container id'}):
-            self.assertNotEqual(host_hash(), hash)
-        self.assertEqual(host_hash(), hash)
+        salted = host_hash('salt')
+        empty_salted = host_hash('')
+
+        self.assertNotEqual(salted, hash)
+        self.assertEqual(empty_salted, hash)
 
     def test_get_mpi_implementation(self):
-        def test(output, expected):
-            execute = MagicMock(return_value=(output, 0))
-            impl = _get_mpi_implementation(execute=execute)
-            self.assertEqual(expected, impl)
+        def test(output, expected, exit_code=0):
+            ret = (output, exit_code) if output is not None else None
+            env = {'VAR': 'val'}
+            with mock.patch("horovod.runner.mpi_run.tiny_shell_exec.execute", return_value=ret) as m:
+                implementation = _get_mpi_implementation(env)
+                self.assertEqual(expected, implementation)
+                m.assert_called_once_with('mpirun --version', env)
 
         test(("mpirun (Open MPI) 2.1.1\n"
               "Report bugs to http://www.open-mpi.org/community/help/\n"), _OMPI_IMPL)
@@ -242,28 +447,15 @@ class RunTests(unittest.TestCase):
 
         test("Unknown MPI v1.00", _UNKNOWN_IMPL)
 
-        execute = MagicMock(return_value=("output", 1))
-        impl = _get_mpi_implementation(execute=execute)
-        self.assertEqual(_MISSING_IMPL, impl)
+        test("output", exit_code=1, expected=_MISSING_IMPL)
 
-        execute = MagicMock(return_value=None)
-        impl = _get_mpi_implementation(execute=execute)
-        self.assertEqual(_MISSING_IMPL, impl)
+        test(None, _MISSING_IMPL)
 
     def test_run_controller(self):
         def test(use_gloo, use_mpi, use_js,
                  gloo_is_built, mpi_is_built,
                  lsf_exists, jsrun_installed,
                  expected, exception):
-            print('testing run controller with gloo={gloo} mpi={mpi} js={js} '
-                  'gloo_built={gloo_is_built} mpi_built={mpi_is_built} '
-                  'lsf_exists={lsf} js_installed={js_is_installed} '
-                  'expected={expected} exception={exception}'
-                  .format(gloo=use_gloo, mpi=use_mpi, js=use_js,
-                          gloo_is_built=gloo_is_built, mpi_is_built=mpi_is_built,
-                          lsf=lsf_exists, js_is_installed=jsrun_installed,
-                          expected=expected, exception=exception))
-
             gloo_run = MagicMock()
             mpi_run = MagicMock()
             js_run = MagicMock()
@@ -306,14 +498,14 @@ class RunTests(unittest.TestCase):
                 if gloo_is_built:
                     expected = 'gloo'
                 else:
-                    exception = '^Gloo support has not been built\.  If this is not expected, ensure CMake is installed ' \
-                                'and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error\.$'
+                    exception = r'^Gloo support has not been built\.  If this is not expected, ensure CMake is installed ' \
+                                r'and reinstall Horovod with HOROVOD_WITH_GLOO=1 to debug the build error\.$'
             elif use_mpi:
                 if mpi_is_built:
                     expected = 'mpi'
                 else:
-                    exception = '^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
-                                'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
+                    exception = r'^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
+                                r'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
             elif use_js:
                 if mpi_is_built:
                     if lsf_exists:
@@ -322,8 +514,8 @@ class RunTests(unittest.TestCase):
                         exception = 'Horovod did not detect an LSF job.  The jsrun launcher can only be used in that environment. ' \
                                     'Please, pick a different launcher for other environments.'
                 else:
-                    exception = '^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
-                                'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
+                    exception = r'^MPI support has not been built\.  If this is not expected, ensure MPI is installed ' \
+                                r'and reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error\.$'
             elif mpi_is_built:
                 if lsf_exists and jsrun_installed:
                     expected = 'js'
@@ -332,8 +524,8 @@ class RunTests(unittest.TestCase):
             elif gloo_is_built:
                 expected = 'gloo'
             else:
-                exception = 'Neither MPI nor Gloo support has been built\. Try reinstalling Horovod ensuring that ' \
-                            'either MPI is installed \(MPI\) or CMake is installed \(Gloo\)\.'
+                exception = r'Neither MPI nor Gloo support has been built\. Try reinstalling Horovod ensuring that ' \
+                            r'either MPI is installed \(MPI\) or CMake is installed \(Gloo\)\.'
 
             test(use_gloo, use_mpi, use_js,
                  gloo_is_built, mpi_is_built,
@@ -345,9 +537,8 @@ class RunTests(unittest.TestCase):
     """
     minimal_settings = hvd_settings.Settings(
         verbose=0,
-        num_hosts=1,
         num_proc=2,
-        hosts='host',
+        hosts='localhost:2',
         run_func_mode=True
     )
 
@@ -360,20 +551,33 @@ class RunTests(unittest.TestCase):
 
         cmd = ['cmd']
         settings = self.minimal_settings
-        run_func = MagicMock(return_value=0)
 
-        mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
 
-        mpi_flags, binding_args = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_cmd = ('mpirun '
-                        '--allow-run-as-root --tag-output '
-                        '-np 2 -H host '
-                        '{binding_args} '
-                        '{mpi_flags}       '
-                        'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
-        expected_env = {}
-        run_func.assert_called_once_with(command=expected_cmd, env=expected_env, stdout=None, stderr=None)
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, None, {}, cmd)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, binding_args = horovod.runner.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_cmd = ('mpirun '
+                                '--allow-run-as-root --tag-output '
+                                '-np 2 -H localhost:2 '
+                                '{binding_args} '
+                                '{mpi_flags}       '
+                                'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
+
+                # remove PYTHONPATH from execute's env
+                # we cannot know the exact value of that env variable
+                # we test right handling of PYTHONPATH in test_mpi_run_*pythonpath* below
+                self.assertIn('env', execute.call_args.kwargs)
+                if 'PYTHONPATH' in execute.call_args.kwargs['env']:
+                    execute.call_args.kwargs['env'].pop('PYTHONPATH')
+
+                expected_env = {'PATH': os.environ.get('PATH')}
+                execute.assert_called_once_with(expected_cmd, env=expected_env, stdout=None, stderr=None)
 
     """
     Tests mpi_run on a large cluster.
@@ -384,23 +588,37 @@ class RunTests(unittest.TestCase):
 
         cmd = ['cmd']
         settings = copy.copy(self.minimal_settings)
-        settings.num_hosts = large_cluster_threshold
-        run_func = MagicMock(return_value=0)
+        settings.hosts = ','.join(['localhost:1'] * large_cluster_threshold)
 
-        mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
 
-        mpi_flags, binding_args = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        mpi_flags.append('-mca plm_rsh_no_tree_spawn true')
-        mpi_flags.append('-mca plm_rsh_num_concurrent {}'.format(settings.num_hosts))
-        expected_cmd = ('mpirun '
-                        '--allow-run-as-root --tag-output '
-                        '-np 2 -H host '
-                        '{binding_args} '
-                        '{mpi_flags}       '
-                        'cmd').format(binding_args=' '.join(binding_args), mpi_flags=' '.join(mpi_flags))
-        expected_env = {}
-        run_func.assert_called_once_with(command=expected_cmd, env=expected_env, stdout=None, stderr=None)
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, None, {}, cmd)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, binding_args = horovod.runner.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                mpi_flags.append('-mca plm_rsh_no_tree_spawn true')
+                mpi_flags.append('-mca plm_rsh_num_concurrent {}'.format(large_cluster_threshold))
+                expected_cmd = ('mpirun '
+                                '--allow-run-as-root --tag-output '
+                                '-np 2 -H {hosts} '
+                                '{binding_args} '
+                                '{mpi_flags}       '
+                                'cmd').format(hosts=settings.hosts, binding_args=' '.join(binding_args),
+                                              mpi_flags=' '.join(mpi_flags))
+
+                # remove PYTHONPATH from execute's env
+                # we cannot know the exact value of that env variable
+                # we test right handling of PYTHONPATH in test_mpi_run_*pythonpath* below
+                self.assertIn('env', execute.call_args.kwargs)
+                if 'PYTHONPATH' in execute.call_args.kwargs['env']:
+                    execute.call_args.kwargs['env'].pop('PYTHONPATH')
+
+                expected_env = {'PATH': os.environ.get('PATH')}
+                execute.assert_called_once_with(expected_cmd, env=expected_env, stdout=None, stderr=None)
 
     """
     Tests mpi_run with full settings.
@@ -421,32 +639,118 @@ class RunTests(unittest.TestCase):
             extra_mpi_args='>mpi-extra args go here<',
             binding_args='>binding args go here<',
             key=secret.make_secret_key(),
-            timeout=tmout,
-            num_hosts=1,
+            start_timeout=tmout,
             num_proc=1,
-            hosts='>host names go here<',
+            hosts='localhost:1',
             output_filename='>output filename goes here<',
             run_func_mode=True
         )
-        run_func = MagicMock(return_value=0)
 
-        mpi_run(settings, nics, env, cmd, stdout=stdout, stderr=stderr, run_func=run_func)
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], []
 
-        mpi_flags, _ = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_command = ('mpirun '
-                            '--allow-run-as-root --tag-output '
-                            '-np 1 -H >host names go here< '
-                            '>binding args go here< '
-                            '{mpi_flags} '
-                            '-mca plm_rsh_args "-p 1022" '
-                            '-mca btl_tcp_if_include eth0,eth1 -x NCCL_SOCKET_IFNAME=eth0,eth1 '
-                            '--output-filename >output filename goes here< '
-                            '-x env1 -x env2 '
-                            '>mpi-extra args go here< '
-                            'cmd arg1 arg2').format(mpi_flags=' '.join(mpi_flags))
-        expected_env = {'env1': 'val1', 'env2': 'val2'}
-        run_func.assert_called_once_with(command=expected_command, env=expected_env, stdout=stdout, stderr=stderr)
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags) as impl:
+            with mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=0) as execute:
+                mpi_run(settings, nics, env, cmd, stdout=stdout, stderr=stderr)
+
+                # assert call on _get_mpi_implementation_flags
+                impl.assert_called_once_with(None, env=env)
+
+                # call the mocked _get_mpi_implementation_flags method ourselves
+                mpi_flags, _ = horovod.runner.mpi_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_command = ('mpirun '
+                                    '--allow-run-as-root --tag-output '
+                                    '-np 1 -H {hosts} '
+                                    '>binding args go here< '
+                                    '{mpi_flags} '
+                                    '-mca plm_rsh_args "-p 1022" '
+                                    '-mca btl_tcp_if_include eth0,eth1 -x NCCL_SOCKET_IFNAME=eth0,eth1 '
+                                    '--output-filename >output filename goes here< '
+                                    '-x env1 -x env2 '
+                                    '>mpi-extra args go here< '
+                                    'cmd arg1 arg2').format(hosts=settings.hosts,
+                                                            mpi_flags=' '.join(mpi_flags))
+
+                # remove PYTHONPATH from execute's env
+                # we cannot know the exact value of that env variable
+                # we test right handling of PYTHONPATH in test_mpi_run_*pythonpath* below
+                self.assertIn('env', execute.call_args.kwargs)
+                if 'PYTHONPATH' in execute.call_args.kwargs['env']:
+                    execute.call_args.kwargs['env'].pop('PYTHONPATH')
+
+                expected_env = {'env1': 'val1', 'env2': 'val2', 'PATH': os.environ.get('PATH')}
+                execute.assert_called_once_with(expected_command, env=expected_env, stdout=stdout, stderr=stderr)
+
+    """
+    Tests mpi_run without PYTHONPATH set.
+    """
+    def test_mpi_run_without_pythonpath(self):
+        self.do_test_mpi_run_env_override({}, {}, 'PYTHONPATH', None)
+
+    """
+    Tests mpi_run with PYTHONPATH set in sys.
+    """
+    def test_mpi_run_with_sys_pythonpath(self):
+        self.do_test_mpi_run_env_override({'PYTHONPATH': 'ppath'}, {}, 'PYTHONPATH', 'ppath')
+
+    """
+    Tests mpi_run with PYTHONPATH set in env.
+    """
+    def test_mpi_run_with_env_pythonpath(self):
+        self.do_test_mpi_run_env_override({}, {'PYTHONPATH': 'ppath'}, 'PYTHONPATH', 'ppath')
+
+    """
+    Tests mpi_run with both PYTHONPATH set.
+    """
+    def test_mpi_run_with_both_pythonpaths(self):
+        self.do_test_mpi_run_env_override({'PYTHONPATH': 'sys-ppath'}, {'PYTHONPATH': 'env-ppath'}, 'PYTHONPATH', 'env-ppath')
+
+    """
+    Tests mpi_run without PATH set.
+    """
+    def test_mpi_run_without_path(self):
+        self.do_test_mpi_run_env_override({}, {}, 'PATH', None)
+
+    """
+    Tests mpi_run with PATH set in sys.
+    """
+    def test_mpi_run_with_sys_path(self):
+        self.do_test_mpi_run_env_override({'PATH': 'ppath'}, {}, 'PATH', 'ppath')
+
+    """
+    Tests mpi_run with PATH set in env.
+    """
+    def test_mpi_run_with_env_path(self):
+        self.do_test_mpi_run_env_override({}, {'PATH': 'ppath'}, 'PATH', 'ppath')
+
+    """
+    Tests mpi_run with both PATH set.
+    """
+    def test_mpi_run_with_both_paths(self):
+        self.do_test_mpi_run_env_override({'PATH': 'sys-path'}, {'PATH': 'env-path'}, 'PATH', 'env-path')
+
+    """
+    Actually tests mpi_run overrides arg env with sys env.
+    """
+    def do_test_mpi_run_env_override(self, sysenv, argenv, env_var, expected):
+        if not mpi_available():
+            self.skipTest("MPI is not available")
+
+        cmd = ['cmd']
+        settings = self.minimal_settings
+
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
+
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags),\
+             mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=0) as execute,\
+             override_env(sysenv):
+            mpi_run(settings, None, argenv, cmd)
+
+            # assert the env variable in the execute's env
+            self.assertIn('env', execute.call_args.kwargs)
+            self.assertEqual(execute.call_args.kwargs['env'].get(env_var), expected)
 
     def test_mpi_run_with_non_zero_exit(self):
         if not mpi_available():
@@ -454,10 +758,54 @@ class RunTests(unittest.TestCase):
 
         cmd = ['cmd']
         settings = self.minimal_settings
-        run_func = MagicMock(return_value=1)
 
-        with pytest.raises(RuntimeError, match="^mpirun failed with exit code 1$") as e:
-            mpi_run(settings, None, {}, cmd, run_func=run_func)
+        def mpi_impl_flags(tcp, env=None):
+            return [], []
+
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=1):
+                with pytest.raises(RuntimeError, match="^mpirun failed with exit code 1$"):
+                    mpi_run(settings, None, {}, cmd)
+
+    """
+    Tests mpi_run with os.environ.
+    """
+    def test_mpi_run_with_os_environ(self):
+        if not mpi_available():
+            self.skipTest("MPI is not available")
+
+        cmd = ['cmd']
+        settings = self.minimal_settings
+
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], ["--mock-mpi-binding-args"]
+
+        with mock.patch("horovod.runner.mpi_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.runner.mpi_run.safe_shell_exec.execute", return_value=0):
+                with pytest.raises(Exception, match="^env argument must be a dict, not <class 'os._Environ'>: "):
+                    mpi_run(settings, None, os.environ, cmd)
+
+    """
+    Tests gloo_run with minimal settings.
+    """
+    def test_gloo_run_minimal(self):
+        if not gloo_built:
+            self.skipTest("Gloo is not available")
+
+        cmd = ['whoami']
+        settings = self.minimal_settings
+        gloo_run(settings, ['lo'], {}, '127.0.0.1', cmd)
+
+    """
+    Tests gloo_run with os.environ.
+    """
+    def test_gloo_run_with_os_environ(self):
+        if not gloo_built:
+            self.skipTest("Gloo is not available")
+
+        cmd = ['whoami']
+        settings = self.minimal_settings
+        gloo_run(settings, ['lo'], os.environ, '127.0.0.1', cmd)
 
     def test_horovodrun_hostfile(self):
         with temppath() as host_filename:
@@ -465,16 +813,16 @@ class RunTests(unittest.TestCase):
                 fp.write('172.31.32.7 slots=8\n')
                 fp.write('172.31.33.9 slots=8\n')
 
-            hosts = parse_host_files(host_filename)
-            self.assertEqual(hosts, '172.31.32.7:8,172.31.33.9:8')
+            hostnames = hosts.parse_host_files(host_filename)
+            self.assertEqual(hostnames, '172.31.32.7:8,172.31.33.9:8')
 
     """
     Tests js_run.
     """
-    @patch('horovod.run.js_run.is_jsrun_installed', MagicMock(return_value=True))
-    @patch('horovod.run.js_run.generate_jsrun_rankfile', MagicMock(return_value='/tmp/rankfile'))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=2))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=2))
+    @mock.patch('horovod.runner.js_run.is_jsrun_installed', MagicMock(return_value=True))
+    @mock.patch('horovod.runner.js_run.generate_jsrun_rankfile', MagicMock(return_value='/tmp/rankfile'))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=2))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=2))
     def test_js_run(self):
         if _get_mpi_implementation_flags(False)[0] is None:
             self.skipTest("MPI is not available")
@@ -486,33 +834,37 @@ class RunTests(unittest.TestCase):
         settings = hvd_settings.Settings(
             verbose=0,
             extra_mpi_args='>mpi-extra args go here<',
-            num_hosts=2,
             num_proc=4,
-            hosts='>host names go here<',
+            hosts='localhost:2,127.0.0.1:2',
             output_filename='>output filename goes here<',
             run_func_mode=True
         )
-        run_func = MagicMock(return_value=0)
 
-        js_run(settings, None, env, cmd, stdout=stdout, stderr=stderr, run_func=run_func)
+        def mpi_impl_flags(tcp, env=None):
+            return ["--mock-mpi-impl-flags"], []
 
-        mpi_flags, _ = _get_mpi_implementation_flags(False)
-        self.assertIsNotNone(mpi_flags)
-        expected_command = ('jsrun '
-                            '--erf_input /tmp/rankfile '
-                            '--stdio_stderr >output filename goes here< '
-                            '--stdio_stdout >output filename goes here< '
-                            '--smpiargs \'{mpi_args} >mpi-extra args go here<\' '
-                            'cmd arg1 arg2').format(mpi_args=' '.join(mpi_flags))
-        expected_env = {'env1': 'val1', 'env2': 'val2'}
-        run_func.assert_called_once_with(command=expected_command, env=expected_env, stdout=stdout, stderr=stderr)
+        with mock.patch("horovod.runner.js_run._get_mpi_implementation_flags", side_effect=mpi_impl_flags):
+            with mock.patch("horovod.runner.js_run.safe_shell_exec.execute", return_value=0) as execute:
+                js_run(settings, None, env, cmd, stdout=stdout, stderr=stderr)
+
+                # call the mocked _get_mpi_implementation_flags method
+                mpi_flags, _ = horovod.runner.js_run._get_mpi_implementation_flags(False)
+                self.assertIsNotNone(mpi_flags)
+                expected_command = ('jsrun '
+                                    '--erf_input /tmp/rankfile '
+                                    '--stdio_stderr >output filename goes here< '
+                                    '--stdio_stdout >output filename goes here< '
+                                    '--smpiargs \'{mpi_args} >mpi-extra args go here<\' '
+                                    'cmd arg1 arg2').format(mpi_args=' '.join(mpi_flags))
+                expected_env = {'env1': 'val1', 'env2': 'val2'}
+                execute.assert_called_once_with(expected_command, env=expected_env, stdout=stdout, stderr=stderr)
 
     """
     Tests generate_jsrun_rankfile.
     """
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=4))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=4))
-    @patch('horovod.run.util.lsf.LSFUtils.get_num_threads', MagicMock(return_value=4))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=4))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_cores', MagicMock(return_value=4))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_threads', MagicMock(return_value=4))
     def test_generate_jsrun_rankfile(self):
         settings = hvd_settings.Settings(
             num_proc=5,
@@ -538,3 +890,17 @@ rank: 4: { hostname: host2; cpu: {0-3} ; gpu: * ; mem: * }
 """)
 
             self.assertMultiLineEqual(gen_rankfile, expected_rankfile)
+
+    """
+    Tests horovod.runner.launch._run with jsrun
+    """
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.using_lsf', MagicMock(return_value=True))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_compute_hosts', MagicMock(return_value=['host1', 'host2']))
+    @mock.patch('horovod.runner.util.lsf.LSFUtils.get_num_gpus', MagicMock(return_value=2))
+    @mock.patch('horovod.runner.util.network.filter_local_addresses', MagicMock(return_value=['host1', 'host2']))
+    @mock.patch('horovod.runner.launch._check_all_hosts_ssh_successful', MagicMock())
+    @mock.patch('horovod.runner.launch.run_controller')
+    def test_run_with_jsrun(self, mocked_run_controller):
+        hargs = _HorovodArgs()
+        _run(hargs)
+        mocked_run_controller.assert_called_once()

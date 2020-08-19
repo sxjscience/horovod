@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
 import copy
@@ -26,7 +24,7 @@ from pyspark import keyword_only
 from pyspark.ml.param.shared import Param, Params
 from pyspark.ml.util import MLWritable, MLReadable
 
-from horovod.run.common.util import codec
+from horovod.runner.common.util import codec
 from horovod.spark.common import util
 from horovod.spark.common.estimator import HorovodEstimator, HorovodModel
 from horovod.spark.common.params import EstimatorParams
@@ -173,7 +171,9 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  validation_steps_per_epoch=None,
                  transformation_fn=None,
                  train_reader_num_workers=None,
-                 val_reader_num_workers=None):
+                 val_reader_num_workers=None,
+                 label_shapes=None):
+
         super(TorchEstimator, self).__init__()
         self._setDefault(loss_constructors=None,
                          input_shapes=None,
@@ -225,7 +225,8 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         util.check_shape_compatibility(metadata,
                                        self.getFeatureCols(),
                                        self.getLabelCols(),
-                                       input_shapes=self.getInputShapes())
+                                       input_shapes=self.getInputShapes(),
+                                       label_shapes=self.getLabelShapes())
 
     def _fit_on_prepared_data(self, backend, train_rows, val_rows, metadata, avg_row_size, dataset_idx=None):
         self._check_params(metadata)

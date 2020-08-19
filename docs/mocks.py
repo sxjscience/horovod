@@ -65,6 +65,9 @@ MOCK_MODULES = [
     'keras.backend',
 
     'torch',
+    'torch.autograd.function',
+    'torch.nn.functional',
+    'torch.nn.modules.batchnorm',
     'torch.utils',
     'torch.utils.data',
     'torch.utils.tensorboard',
@@ -100,6 +103,13 @@ MOCK_TREE = {
     },
     'torch': {
         '__version__': '1.0.0',
+        'nn': {
+            'modules': {
+                'batchnorm': {
+                    '_BatchNorm': MagicMock,
+                }
+            },
+        },
     },
     'pyspark': {
         'ml': {

@@ -1,5 +1,6 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2019 Uber Technologies, Inc.
+// Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +23,7 @@
 #include <vector>
 
 #if HAVE_CUDA
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 using gpuError_t = cudaError_t;
 using gpuEvent_t = cudaEvent_t;
@@ -68,7 +70,8 @@ public:
                    gpuStream_t& stream);
 
   void WaitForEvents(std::queue<std::pair<std::string, gpuEvent_t>>& event_queue,
-                     const std::vector<TensorTableEntry>& entries, Timeline& timeline);
+                     const std::vector<TensorTableEntry>& entries, Timeline& timeline,
+                     const std::function<void()>& error_check_callback = nullptr);
 
   void StreamCreate(gpuStream_t *stream);
   void StreamSynchronize(gpuStream_t stream);
@@ -80,6 +83,9 @@ public:
   void MemcpyAsyncD2D(void* dst, const void* src, size_t count, gpuStream_t stream);
   void MemcpyAsyncH2D(void* dst, const void* src, size_t count, gpuStream_t stream);
   void MemcpyAsyncD2H(void* dst, const void* src, size_t count, gpuStream_t stream);
+
+  void ScaleBufferImpl(const void* fused_input_data, void* buffer_data, int64_t num_elements,
+                       double scale_factor, DataType dtype, gpuStream_t stream);
 
   // Thread pool for finalizer threads
   ThreadPool finalizer_thread_pool;
@@ -98,7 +104,8 @@ public:
 
   void InitGPUQueue(const std::vector<TensorTableEntry>& entries, const Response& response);
 
-  Status FinalizeGPUQueue(const std::vector<TensorTableEntry>& entries, bool free_host_buffer = true);
+  Status FinalizeGPUQueue(const std::vector<TensorTableEntry>& entries, bool free_host_buffer = true,
+                          const std::function<void()>& error_check_callback = nullptr);
 
   // GPU events are used as an alternative to host-device synchronization (which stalls the GPU pipeline)
   // for the purpose of recording timing on the Horovod timeline.
@@ -135,8 +142,12 @@ protected:
   void MemcpyEntryOutFusionBuffer(const std::vector<TensorTableEntry>& entries,
                                   const void* buffer_data_at_offset, TensorTableEntry& e) override;
 
+  void ScaleBuffer(double scale_factor, const std::vector<TensorTableEntry>& entries,
+                   const void* fused_input_data, void* buffer_data, int64_t num_elements);
+
   GPUContext* gpu_context_;
   GPUOpContext gpu_op_context_;
+
 };
 
 class GPUAllgather : public AllgatherOp {
@@ -171,6 +182,18 @@ public:
 
 protected:
   struct GPUContext* gpu_context_;
+  GPUOpContext gpu_op_context_;
+};
+
+class GPUAlltoall : public AlltoallOp {
+public:
+  GPUAlltoall(GPUContext* context,
+              HorovodGlobalState* global_state);
+  bool Enabled(const ParameterManager& param_manager,
+               const std::vector<TensorTableEntry>& entries,
+               const Response& response) const override;
+protected:
+  GPUContext* gpu_context_;
   GPUOpContext gpu_op_context_;
 };
 

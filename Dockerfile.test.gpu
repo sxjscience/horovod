@@ -7,14 +7,18 @@ ARG CUDA_DOCKER_VERSION=10.0-devel-ubuntu16.04
 ARG CUDNN_VERSION=7.6.0.64-1+cuda10.0
 ARG NCCL_VERSION_OVERRIDE=2.4.7-1+cuda10.0
 ARG MPI_KIND=OpenMPI
-ARG PYTHON_VERSION=2.7
-ARG TENSORFLOW_PACKAGE=tensorflow-gpu==1.14.0
+ARG PYTHON_VERSION=3.6
+ARG TENSORFLOW_PACKAGE=tensorflow-gpu==1.15.0
 ARG KERAS_PACKAGE=keras==2.2.4
 ARG PYTORCH_PACKAGE=torch==1.2.0
 ARG TORCHVISION_PACKAGE=torchvision==0.4.0
 ARG MXNET_PACKAGE=mxnet-cu100==1.5.0
 ARG PYSPARK_PACKAGE=pyspark==2.4.0
-ARG HOROVOD_BUILD_FLAGS="HOROVOD_GPU_ALLREDUCE=NCCL HOROVOD_GPU_BROADCAST=NCCL"
+# if SPARK_PACKAGE is set, installs Spark into /spark from the tgz archive
+# if SPARK_PACKAGE is a preview version, installs PySpark from the tgz archive
+# see https://archive.apache.org/dist/spark/ for available packages, version must match PYSPARK_PACKAGE
+ARG SPARK_PACKAGE=spark-2.4.0/spark-2.4.0-bin-hadoop2.7.tgz
+ARG HOROVOD_BUILD_FLAGS="HOROVOD_GPU_OPERATIONS=NCCL"
 ARG HOROVOD_MIXED_INSTALL=0
 
 # Set default shell to /bin/bash
@@ -26,12 +30,18 @@ RUN apt-get update -qq && apt-get install -y --allow-downgrades --allow-change-h
         ca-certificates \
         cmake \
         openssh-client \
+        openssh-server \
         git \
         build-essential \
         g++-4.8 \
+        moreutils \
         libcudnn7=${CUDNN_VERSION} \
         libnccl2=${NCCL_VERSION_OVERRIDE} \
         libnccl-dev=${NCCL_VERSION_OVERRIDE}
+
+# setup ssh service
+RUN ssh-keygen -f /root/.ssh/id_rsa -q -N ''
+RUN cp -v /root/.ssh/id_rsa.pub /root/.ssh/authorized_keys
 
 # install g++-7
 RUN apt-get install -y --no-install-recommends software-properties-common
@@ -39,22 +49,30 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/test
 RUN apt-get update -qq && apt-get install -y --no-install-recommends g++-7
 
 # Install Python.
-RUN apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev
-RUN if [[ "${PYTHON_VERSION}" == "3.6" ]]; then \
-        apt-get install -y python${PYTHON_VERSION}-distutils; \
-    fi
+RUN apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-distutils
 RUN ln -s -f /usr/bin/python${PYTHON_VERSION} /usr/bin/python
-RUN wget https://bootstrap.pypa.io/get-pip.py && python get-pip.py && rm get-pip.py
-RUN pip install -U --force pip 'setuptools<46.0.0' requests pytest mock pytest-forked
+RUN wget --progress=dot:mega https://bootstrap.pypa.io/get-pip.py && python get-pip.py && rm get-pip.py
+RUN pip install -U --force pip setuptools requests pytest mock pytest-forked parameterized
+
+# Install Spark stand-alone cluster.
+RUN if [[ -n ${SPARK_PACKAGE} ]]; then \
+        wget --progress=dot:giga https://archive.apache.org/dist/spark/${SPARK_PACKAGE} -O - | tar -xzC /tmp; \
+        archive=$(basename "${SPARK_PACKAGE}") bash -c "mv -v /tmp/\${archive/%.tgz/} /spark"; \
+    fi
 
 # Install PySpark.
 RUN apt-get update -qq && apt install -y openjdk-8-jdk-headless
-RUN pip install ${PYSPARK_PACKAGE}
-RUN pip install 'pyarrow<0.16.0'
+RUN if [[ ${SPARK_PACKAGE} != *"-preview"* ]]; then \
+        pip install ${PYSPARK_PACKAGE}; \
+    else \
+        apt-get install pandoc; \
+        pip install pypandoc; \
+        (cd /spark/python && python setup.py sdist && pip install dist/pyspark-*.tar.gz && rm dist/pyspark-*); \
+    fi
 
 # Install MPI.
 RUN if [[ ${MPI_KIND} == "OpenMPI" ]]; then \
-        wget -O /tmp/openmpi-3.0.0-bin.tar.gz https://github.com/horovod/horovod/files/1596799/openmpi-3.0.0-bin.tar.gz && \
+        wget --progress=dot:mega -O /tmp/openmpi-3.0.0-bin.tar.gz https://github.com/horovod/horovod/files/1596799/openmpi-3.0.0-bin.tar.gz && \
             cd /usr/local && tar -zxf /tmp/openmpi-3.0.0-bin.tar.gz && ldconfig && \
             echo "mpirun -allow-run-as-root -np 2 -H localhost:2 -bind-to none -map-by slot -mca mpi_abort_print_stack 1" > /mpirun_command; \
     elif [[ ${MPI_KIND} == "MPICH" ]]; then \
@@ -78,7 +96,7 @@ RUN pip install ${TENSORFLOW_PACKAGE}
 
 # Install Keras.
 # Pin scipy<1.4.0: https://github.com/scipy/scipy/issues/11237
-RUN pip install ${KERAS_PACKAGE} h5py "scipy<1.4.0" pandas
+RUN pip install ${KERAS_PACKAGE} h5py "scipy<1.4.0" "pandas<1.1.0"
 RUN mkdir -p ~/.keras
 RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
     python -c "from keras.datasets import mnist; mnist.load_data()" && \
@@ -86,17 +104,17 @@ RUN ldconfig /usr/local/cuda/targets/x86_64-linux/lib/stubs && \
 
 # Install PyTorch.
 RUN pip install future typing
-RUN if [[ ${PYTORCH_PACKAGE} == "torch-nightly" ]]; then \
-        PYTORCH_CUDA=$(echo ${CUDA_DOCKER_VERSION} | awk -F- '{print $1}' | sed 's/\.//'); \
-	pip install --pre torch ${TORCHVISION_PACKAGE} -v -f https://download.pytorch.org/whl/nightly/cu${PYTORCH_CUDA}/torch_nightly.html; \
+RUN PYTORCH_CUDA=$(echo ${CUDA_DOCKER_VERSION} | awk -F- '{print $1}' | sed 's/\.//'); \
+    if [[ ${PYTORCH_PACKAGE} == "torch-nightly" ]]; then \
+	    pip install --pre torch ${TORCHVISION_PACKAGE} -v -f https://download.pytorch.org/whl/nightly/cu${PYTORCH_CUDA}/torch_nightly.html; \
     else \
-        pip install ${PYTORCH_PACKAGE} ${TORCHVISION_PACKAGE} -f https://download.pytorch.org/whl/torch_stable.html; \
+        pip install ${PYTORCH_PACKAGE} ${TORCHVISION_PACKAGE} -f https://download.pytorch.org/whl/cu${PYTORCH_CUDA}/torch_stable.html; \
     fi
 # Pin Pillow<7.0: https://github.com/pytorch/vision/issues/1718
 RUN pip install "Pillow<7.0" --no-deps
 
 # Install MXNet.
-RUN if [[ ${MXNET_PACKAGE} == "mxnet-nightly" && ${PYTHON_VERSION} != "2.7" ]]; then \
+RUN if [[ ${MXNET_PACKAGE} == "mxnet-nightly" ]]; then \
         pip install --pre mxnet-cu101mkl -f https://dist.mxnet.io/python/all; \
     else \
         pip install ${MXNET_PACKAGE} ; \
@@ -115,7 +133,7 @@ RUN if [[ ${TENSORFLOW_PACKAGE} == "tensorflow-gpu==1.1.0" ]]; then \
 
 # Prefetch Spark MNIST dataset.
 RUN mkdir -p /work
-RUN mkdir -p /data && wget https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/multiclass/mnist.bz2 -O /data/mnist.bz2
+RUN mkdir -p /data && wget --progress=dot:mega https://horovod-datasets.s3.amazonaws.com/mnist.bz2 -O /data/mnist.bz2
 
 # Hack TensorFlow MNIST example to be smaller.
 RUN sed -i "s/last_step=20000/last_step=100/" /horovod/examples/tensorflow_mnist.py
@@ -138,7 +156,7 @@ RUN sed -i "s/'--epochs', type=int, default=10,/'--epochs', type=int, default=2,
 
 # Prefetch Spark Rossmann dataset.
 RUN mkdir -p /work
-RUN mkdir -p /data && wget http://files.fast.ai/part2/lesson14/rossmann.tgz -O - | tar -xzC /data
+RUN mkdir -p /data && wget --progress=dot:mega http://files.fast.ai/part2/lesson14/rossmann.tgz -O - | tar -xzC /data
 
 # Hack Keras Spark Rossmann Run example to be smaller.
 RUN sed -i "s/x = Dense(1000,/x = Dense(100,/g" /horovod/examples/keras_spark_rossmann_run.py

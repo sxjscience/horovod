@@ -1,4 +1,5 @@
 # Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+# Modifications copyright (C) 2020, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,18 +14,17 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
+import pytest
 import itertools
 import unittest
 import numpy as np
 import mxnet as mx
 
+from distutils.version import LooseVersion
+
 from mxnet.base import MXNetError
-from mxnet.test_utils import same
+from mxnet.test_utils import almost_equal, same
 
 import horovod.mxnet as hvd
 
@@ -32,6 +32,9 @@ has_gpu = mx.context.num_gpus() > 0
 
 ccl_supported_types = set(['int32', 'int64', 'float32', 'float64'])
 
+# MXNet 1.4.x will kill test MPI process if error occurs during operation enqueue. Skip
+# those tests for versions earlier than 1.5.0.
+_skip_enqueue_errors = LooseVersion(mx.__version__) < LooseVersion('1.5.0')
 
 class MXTests(unittest.TestCase):
     """
@@ -68,7 +71,6 @@ class MXTests(unittest.TestCase):
             tensor = tensor.astype(dtype)
             summed = hvd.allreduce(tensor, average=False, name=str(count))
             multiplied = tensor * size
-            max_difference = mx.nd.max(mx.nd.subtract(summed, multiplied))
             count += 1
 
             # Threshold for floating point equality depends on number of
@@ -82,14 +84,8 @@ class MXTests(unittest.TestCase):
             else:
                 break
 
-            if max_difference > threshold:
-                print("allreduce", count, dtype, dim, max_difference,
-                      threshold)
-                print("tensor", hvd.rank(), tensor)
-                print("summed", hvd.rank(), summed)
-                print("multiplied", hvd.rank(), multiplied)
-            assert max_difference <= threshold, 'hvd.allreduce produces \
-                                                 incorrect results'
+            assert almost_equal(summed.asnumpy(), multiplied.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
 
     def test_horovod_allreduce_average(self):
         """Test that the allreduce correctly sums 1D, 2D, 3D tensors."""
@@ -109,7 +105,6 @@ class MXTests(unittest.TestCase):
             averaged = hvd.allreduce(tensor, average=True, name=str(count))
             tensor *= size
             tensor /= size
-            max_difference = mx.nd.max(mx.nd.subtract(averaged, tensor))
             count += 1
 
             # Threshold for floating point equality depends on number of
@@ -123,12 +118,8 @@ class MXTests(unittest.TestCase):
             else:
                 break
 
-            if max_difference > threshold:
-                print("average", count, dtype, dim, max_difference, threshold)
-                print("tensor", hvd.rank(), tensor)
-                print("averaged", hvd.rank(), averaged)
-            assert max_difference <= threshold, 'hvd.allreduce produces \
-                                                 incorrect results for average'
+            assert almost_equal(averaged.asnumpy(), tensor.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results for average: {hvd.rank()} {count} {dtype} {dim}'
 
     def test_horovod_allreduce_inplace(self):
         """Test that the allreduce correctly sums 1D, 2D, 3D tensors."""
@@ -147,7 +138,6 @@ class MXTests(unittest.TestCase):
             tensor = tensor.astype(dtype)
             multiplied = tensor * size
             hvd.allreduce_(tensor, average=False, name=str(count))
-            max_difference = mx.nd.max(mx.nd.subtract(tensor, multiplied))
             count += 1
 
             # Threshold for floating point equality depends on number of
@@ -161,12 +151,113 @@ class MXTests(unittest.TestCase):
             else:
                 break
 
-            if max_difference > threshold:
-                print("self", count, dtype, dim, max_difference, threshold)
-                print("tensor", hvd.rank(), tensor)
-                print("multiplied", hvd.rank(), multiplied)
-            assert max_difference <= threshold, 'hvd.allreduce produces \
-                                                 incorrect results for self'
+            assert almost_equal(tensor.asnumpy(), multiplied.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results for self: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_allreduce_prescale(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors with prescaling."""
+        hvd.init()
+        size = hvd.size()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float16', 'float32', 'float64'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 1
+        shapes = [(), (17), (17, 17), (17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            factor = np.random.uniform()
+            scaled = hvd.allreduce(tensor, average=False, name=str(count),
+                                   prescale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float64' if dtype in int_types else dtype)
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+
+            expected = factor * tensor
+            expected = expected.astype(dtype)
+            expected *= size
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in int_types:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(expected.asnumpy(), scaled.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results for prescaling: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_allreduce_postscale(self):
+        """Test that the allreduce correctly sums 1D, 2D, 3D tensors with postscaling."""
+        hvd.init()
+        size = hvd.size()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float16', 'float32', 'float64'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 1
+        shapes = [(), (17), (17, 17), (17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            factor = np.random.uniform()
+            scaled = hvd.allreduce(tensor, average=False, name=str(count),
+                                   postscale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float64' if dtype in int_types else dtype)
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+
+            expected = tensor * size
+            expected *= factor
+            expected = expected.astype(dtype)
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in int_types:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(expected.asnumpy(), scaled.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results for pre/post scaling: {hvd.rank()} {count} {dtype} {dim}'
+
 
     def test_horovod_allreduce_error(self):
         """Test that the allreduce raises an error if different ranks try to
@@ -234,9 +325,9 @@ class MXTests(unittest.TestCase):
     def test_horovod_allreduce_cpu_gpu_error(self):
         """Test that the allreduce raises an error if different ranks try to
            perform reduction on CPU and GPU."""
-        if os.environ.get('HOROVOD_MIXED_INSTALL'):
-            # Skip if compiled with CUDA but without HOROVOD_GPU_ALLREDUCE.
-            self.skipTest("Not compiled with HOROVOD_GPU_ALLREDUCE")
+        if int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+            # Skip if compiled with CUDA but without HOROVOD_GPU_OPERATIONS.
+            self.skipTest("Not compiled with HOROVOD_GPU_OPERATIONS")
 
         hvd.init()
         rank = hvd.rank()
@@ -501,6 +592,332 @@ class MXTests(unittest.TestCase):
         for tensor, root_tensor in zip(tensors, root_tensors):
             assert same(tensor.asnumpy(), root_tensor.asnumpy()), \
                 'horovod did not broadcast deferred initialized parameter correctly'
+
+    def test_horovod_allgather(self):
+        """Test that the allgather correctly gathers 1D, 2D, 3D tensors."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensor = mx.ndarray.ones(shape=[17] * dim, dtype=dtype, ctx=ctx) * rank
+            gathered = hvd.allgather(tensor)
+
+            assert list(gathered.shape) == [17 * size] + [17] * (dim - 1)
+
+            for i in range(size):
+                rank_tensor = gathered[i * 17:(i + 1) * 17]
+                assert list(rank_tensor.shape) == [17] * dim, \
+                    'hvd.allgather produces incorrect gathered shape'
+                assert rank_tensor.min() == i, 'hvd.allgather produces incorrect gathered tensor'
+                assert rank_tensor.max() == i, 'hvd.allgather produces incorrect gathered tensor'
+
+    def test_horovod_allgather_variable_size(self):
+        """Test that the allgather correctly gathers 1D, 2D, 3D tensors,
+        even if those tensors have different sizes along the first dim."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            # Support tests up to MPI Size of 35
+            if size > 35:
+                break
+
+            tensor_sizes = [17, 32, 81, 12, 15, 23, 22] * 5
+            tensor_sizes = tensor_sizes[:size]
+
+            tensor = mx.ndarray.ones(
+                shape=[tensor_sizes[rank]] + [17] * (dim - 1), dtype=dtype, ctx=ctx) * rank
+
+            gathered = hvd.allgather(tensor)
+
+            expected_size = sum(tensor_sizes)
+            assert list(gathered.shape) == [expected_size] + [17] * (dim - 1)
+
+            for i in range(size):
+                rank_size = [tensor_sizes[i]] + [17] * (dim - 1)
+                rank_tensor = gathered[sum(
+                    tensor_sizes[:i]):sum(tensor_sizes[:i + 1])]
+                assert list(rank_tensor.shape) == rank_size
+                assert rank_tensor.min() == i
+                assert rank_tensor.max() == i
+
+    def test_horovod_allgather_error(self):
+        """Test that the allgather returns an error if any dimension besides
+        the first is different among the tensors being gathered."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        ctx = self._current_context()
+
+        tensor_size = [17] * 3
+        tensor_size[1] = 10 * (rank + 1)
+        tensor = mx.ndarray.ones(shape=tensor_size, ctx=ctx)
+
+        try:
+            hvd.allgather(tensor)
+            assert False, 'hvd.allgather did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    def test_horovod_allgather_type_error(self):
+        """Test that the allgather returns an error if the types being gathered
+        differ among the processes"""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        ctx = self._current_context()
+
+        tensor_size = [17] * 3
+        if rank % 2 == 0:
+            tensor = mx.ndarray.ones(shape=tensor_size, dtype="int32", ctx=ctx)
+        else:
+            tensor = mx.ndarray.ones(shape=tensor_size, dtype="float32", ctx=ctx)
+
+        try:
+            hvd.allgather(tensor)
+            assert False, 'hvd.allgather did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    def test_broadcast_object(self):
+        hvd.init()
+
+        expected_obj = {
+            'hello': 123,
+            0: [1, 2]
+        }
+        obj = expected_obj if hvd.rank() == 0 else {}
+
+        obj = hvd.broadcast_object(obj, root_rank=0)
+        self.assertDictEqual(obj, expected_obj)
+
+        # To prevent premature shutdown from rank 0 for this test
+        mx.nd.waitall()
+
+    def test_allgather_object(self):
+        hvd.init()
+
+        d = {'metric_val_1': hvd.rank()}
+        if hvd.rank() == 1:
+            d['metric_val_2'] = 42
+
+        results = hvd.allgather_object(d)
+
+        expected = [{'metric_val_1': i} for i in range(hvd.size())]
+        if hvd.size() > 1:
+            expected[1] = {'metric_val_1': 1, 'metric_val_2': 42}
+
+        self.assertEqual(len(results), hvd.size())
+        self.assertListEqual(results, expected)
+
+        # To prevent premature shutdown from rank 0 for this test
+        mx.nd.waitall()
+
+    def test_horovod_alltoall(self):
+        """Test that the alltoall correctly distributes 1D, 2D, and 3D tensors."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1,2,3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = mx.ndarray.array(vals, dtype=dtype, ctx=ctx)
+            for _ in range(dim - 1):
+              tensor = mx.ndarray.expand_dims(tensor, axis=1)
+              tensor = mx.ndarray.concat(tensor, tensor, dim=1)
+
+            splits = mx.ndarray.array([rank + 1] * size, dtype='int32', ctx=ctx)
+            collected = hvd.alltoall(tensor, splits)
+
+            assert collected.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.size == size * (size + 1) // 2 * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+
+    def test_horovod_alltoall_equal_split(self):
+        """Test that the alltoall correctly distributes 1D tensors with default splitting."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1,2,3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            vals = []
+            for i in range(size):
+              vals += [i] * (rank + 1)
+
+            tensor = mx.ndarray.array(vals, dtype=dtype, ctx=ctx)
+            for _ in range(dim - 1):
+              tensor = mx.ndarray.expand_dims(tensor, axis=1)
+              tensor = mx.ndarray.concat(tensor, tensor, dim=1)
+            collected = hvd.alltoall(tensor)
+
+            assert collected.min() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.max() == rank, 'hvd.alltoall produces incorrect collected tensor'
+            assert collected.size == size * (size + 1) // 2 * 2**(dim - 1), 'hvd.alltoall collected wrong number of values'
+
+    def test_horovod_alltoall_type_error(self):
+        """Test that the alltoall returns an error if the tensor types differ
+           across the processes."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        ctx = self._current_context()
+        if rank % 2:
+          tensor = mx.ndarray.empty([size], dtype='int32', ctx=ctx)
+        else:
+          tensor = mx.ndarray.empty([size], dtype='float32', ctx=ctx)
+
+        try:
+            output = hvd.alltoall(tensor)
+            output.wait_to_read()
+            assert False, 'hvd.alltoall did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    @pytest.mark.skipif(_skip_enqueue_errors,
+                        reason="Skip enqueue errors for MXNet version < 1.5.0")
+    def test_horovod_alltoall_equal_split_length_error(self):
+        """Test that the alltoall with default splitting returns an error if the first dimension
+        of tensor is not a multiple of the number of workers."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        ctx = self._current_context()
+        tensor = mx.ndarray.empty([size + 1], ctx=ctx)
+        try:
+            hvd.alltoall(tensor)
+            assert False, 'hvd.alltoall did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    @pytest.mark.skipif(_skip_enqueue_errors,
+                        reason="Skip enqueue errors for MXNet version < 1.5.0")
+    def test_horovod_alltoall_splits_error(self):
+        """Test that the alltoall returns an error if the sum of the splits entries exceeds
+        the first dimension of the input tensor."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        ctx = self._current_context()
+        tensor = mx.ndarray.empty([size-1], ctx=ctx)
+        splits = mx.ndarray.ones([size], dtype='int32', ctx=ctx)
+        try:
+            hvd.alltoall(tensor, splits)
+            assert False, 'hvd.alltoall did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    @pytest.mark.skipif(_skip_enqueue_errors,
+                        reason="Skip enqueue errors for MXNet version < 1.5.0")
+    def test_horovod_alltoall_splits_type_error(self):
+        """Test that the alltoall returns an error if the splits tensor does not
+           contain 32-bit integers."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        ctx = self._current_context()
+        tensor = mx.ndarray.empty([size], ctx=ctx)
+        splits = mx.ndarray.ones([size], dtype='float32', ctx=ctx)
+        try:
+            hvd.alltoall(tensor, splits)
+            assert False, 'hvd.alltoall did not throw error'
+        except (MXNetError, ValueError):
+            pass
+
+    def test_horovod_alltoall_rank_error(self):
+        """Test that the alltoall returns an error if any dimension besides
+        the first is different among the tensors being processed."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            self.skipTest("Only one worker available")
+
+        # This test does not apply if NCCL version < 2.7.0
+        if hvd.nccl_built() and hvd.nccl_built() < 2700:
+            self.skipTest("NCCL-based Alltoall requires NCCL version >= 2.7.0.")
+
+        ctx = self._current_context()
+
+        tensor_size = [2 * size] * 3
+        tensor_size[1] = 10 * (rank + 1)
+        tensor = mx.ndarray.ones(shape=tensor_size, ctx=ctx)
+
+        try:
+            output = hvd.alltoall(tensor)
+            output.wait_to_read()
+            assert False, 'hvd.alltoall did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
 
     @unittest.skipUnless(has_gpu, "no gpu detected")
     def test_gluon_trainer(self):

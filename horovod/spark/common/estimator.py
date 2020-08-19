@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
 from pyspark.ml import Estimator, Model
@@ -47,8 +45,7 @@ class HorovodEstimator(Estimator, EstimatorParams):
         """
         if params:
             return self.copy(params)._fit_on_parquet()
-        else:
-            return self._fit_on_parquet()
+        return self._fit_on_parquet()
 
     def _fit_on_parquet(self):
         backend = self._get_or_create_backend()
@@ -85,7 +82,7 @@ class HorovodEstimator(Estimator, EstimatorParams):
     def _get_or_create_backend(self):
         backend = self.getBackend()
         if backend is None:
-            backend = SparkBackend(self.getNumProc())
+            backend = SparkBackend(self.getNumProc(), verbose=self.getVerbose())
         elif self.getNumProc() is not None:
             raise ValueError('At most one of parameters "backend" and "num_proc" may be specified')
         return backend

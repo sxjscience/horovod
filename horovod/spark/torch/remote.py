@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import contextlib
 import io
 import math
@@ -38,6 +36,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
     # Estimator parameters
     gradient_compression = estimator.getGradientCompression()
     input_shapes = estimator.getInputShapes()
+    label_shapes = estimator.getLabelShapes()
     feature_columns = estimator.getFeatureCols()
     label_columns = estimator.getLabelCols()
     num_labels = len(label_columns)
@@ -94,7 +93,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
     def train(serialized_model, optimizer_cls, model_opt_state_serialized,
               train_rows, val_rows, avg_row_size):
         from petastorm import TransformSpec, make_reader, make_batch_reader
-        from petastorm.pytorch import DataLoader
+        from petastorm.pytorch import BatchedDataLoader
         import torch
         import horovod.torch as hvd
 
@@ -237,9 +236,9 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                                     **reader_factory_kwargs) \
                     if should_validate else empty_batch_reader() as val_reader:
 
-                    train_loader = DataLoader(train_reader,
-                                              batch_size=batch_size,
-                                              shuffling_queue_capacity=shuffle_buffer_size)
+                    train_loader = BatchedDataLoader(train_reader,
+                                                     batch_size=batch_size,
+                                                     shuffling_queue_capacity=shuffle_buffer_size)
                     train_loader_iter = iter(train_loader)
 
                     def prepare_batch(row):
@@ -253,6 +252,8 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                             for col in label_columns]
 
                         sample_weights = row.get(sample_weight_col, None)
+                        if sample_weights is not None:
+                            sample_weights = sample_weights.float()
                         if cuda_available:
                             inputs = [input.cuda() for input in inputs]
                             labels = [label.cuda() for label in labels]
@@ -266,9 +267,16 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
 
                         # reshape labels to match the output shape of the model
                         if hasattr(outputs[0], 'shape'):
-                            labels = [label.reshape(output.shape)
-                                      if output.shape.numel() == label.shape.numel() else label
-                                      for label, output in zip(labels, outputs)]
+                            if label_shapes:
+                                labels = [label.reshape(label_shape)
+                                          for label, label_shape in zip(labels, label_shapes)]
+                            else:
+                                # If label_shapes parameter is not provided, reshape the label
+                                # columns data to match the shape of the model output
+                                labels = [label.reshape(output.shape) if
+                                          output.shape.numel() == label.shape.numel() else label
+                                          for label, output in zip(labels, outputs)]
+
                         return outputs, labels
 
                     def aggregate_metrics(stage, epoch, loss, metric_value_groups):
@@ -313,7 +321,7 @@ def RemoteTrainer(estimator, metadata, last_checkpoint_state, run_id, dataset_id
                         return aggregate_metrics('train', epoch, train_loss, metric_value_groups)
 
                     if should_validate:
-                        val_loader = DataLoader(val_reader, batch_size=batch_size)
+                        val_loader = BatchedDataLoader(val_reader, batch_size=batch_size)
                         val_loader_iter = iter(val_loader)
                         if validation_steps_per_epoch is None:
                             validation_steps = int(math.ceil(float(val_rows) / batch_size / hvd.size()))

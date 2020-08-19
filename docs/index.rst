@@ -109,12 +109,16 @@ Guides
 
    running_include
 
+   elastic_include
+
    benchmarks_include
 
    inference_include
 
    gpus_include
 
+   conda_include
+   
    docker_include
 
    spark_include
@@ -122,6 +126,8 @@ Guides
    lsf_include
 
    tensor-fusion_include
+   
+   adasum_user_guide_include
 
    timeline_include
 

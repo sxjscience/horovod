@@ -13,12 +13,17 @@
 # limitations under the License.
 # ==============================================================================
 
+from distutils.version import LooseVersion
+
 import horovod.tensorflow as hvd
 import tensorflow as tf
 
 
+_PRE_TF_2_4_0 = LooseVersion(tf.__version__) < LooseVersion('2.4.0')
+
+
 def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sparse,
-                                 compression, sparse_as_dense):
+                                 compression, sparse_as_dense, gradient_predivide_factor):
     class _DistributedOptimizer(keras.optimizers.Optimizer):
         _HAS_AGGREGATE_GRAD = True
 
@@ -29,6 +34,7 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             self._compression = compression
             self._sparse_as_dense = sparse_as_dense
             self._aggregated_gradients = False
+            self._gradient_predivide_factor = gradient_predivide_factor
             super(self.__class__, self).__init__(**kwargs)
 
         def get_gradients(self, loss, params):
@@ -44,12 +50,28 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
             return self._allreduce(gradients)
 
         def _aggregate_gradients(self, grads_and_vars):
-            gradients = [grad for grad, var in grads_and_vars]
-            return self._allreduce(gradients)
+            grads, vars = list(zip(*grads_and_vars))
+            aggregated_grads = self._allreduce(grads)
+            if _PRE_TF_2_4_0:
+                # Prior to TF 2.4.0, this function was expected to return only a list of
+                # grads, not a list of (grad, var) tuples.
+                return aggregated_grads
+            return list(zip(aggregated_grads, vars))
 
         def _allreduce(self, gradients):
             self._aggregated_gradients = True
             if hvd.size() > 1:
+                if self._gradient_predivide_factor != 1.0:
+                    # Perform averaging via pre/postscaling factors.
+                    # Split average operation across pre/postscale factors
+                    prescale_factor = 1.0 / gradient_predivide_factor
+                    postscale_factor = gradient_predivide_factor / hvd.size()
+                    do_average = False
+                else:
+                    prescale_factor = 1.0
+                    postscale_factor = 1.0
+                    do_average = True
+
                 averaged_gradients = []
                 with tf.name_scope(self._name + "_Allreduce"):
                     for grad in gradients:
@@ -58,9 +80,12 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                                     isinstance(grad, tf.IndexedSlices):
                                 grad = tf.convert_to_tensor(grad)
                             avg_grad = hvd.allreduce(grad,
+                                                     average=do_average,
                                                      device_dense=self._device_dense,
                                                      device_sparse=self._device_sparse,
-                                                     compression=self._compression)
+                                                     compression=self._compression,
+                                                     prescale_factor=prescale_factor,
+                                                     postscale_factor=postscale_factor)
                             averaged_gradients.append(avg_grad)
                         else:
                             averaged_gradients.append(None)
@@ -69,12 +94,13 @@ def create_distributed_optimizer(keras, optimizer, name, device_dense, device_sp
                 return gradients
 
         def apply_gradients(self, *args, **kwargs):
+            results = super(self.__class__, self).apply_gradients(*args, **kwargs)
             if not self._aggregated_gradients:
                 raise Exception('`apply_gradients()` was called without a call to '
                                 '`get_gradients()` or `_aggregate_gradients`. If you\'re '
                                 'using TensorFlow 2.0, please specify '
                                 '`experimental_run_tf_function=False` in `compile()`.')
-            return super(self.__class__, self).apply_gradients(*args, **kwargs)
+            return results
 
     # We dynamically create a new class that inherits from the optimizer that was passed in.
     # The goal is to override get_gradients() method with an allreduce implementation.
@@ -97,8 +123,10 @@ if hasattr(hvd, 'broadcast_global_variables'):
         return _eval(backend, hvd.broadcast_global_variables(root_rank))
 
 
-def allreduce(backend, value, name, average):
-    return _eval(backend, hvd.allreduce(tf.constant(value, name=name), average=average))
+def allreduce(backend, value, name, average, prescale_factor, postscale_factor):
+    return _eval(backend, hvd.allreduce(tf.constant(value, name=name), average=average,
+                                        prescale_factor=prescale_factor,
+                                        postscale_factor=postscale_factor))
 
 
 def allgather(backend, value, name):
@@ -109,11 +137,11 @@ def broadcast(backend, value, root_rank, name):
     return _eval(backend, hvd.broadcast(tf.constant(value, name=name), root_rank))
 
 
-def load_model(keras, wrap_optimizer, filepath, custom_optimizers, custom_objects):
+def load_model(keras, wrap_optimizer, optimizer_modules, filepath, custom_optimizers, custom_objects):
     horovod_objects = {
         subclass.__name__.lower(): wrap_optimizer(subclass)
         for subclass in keras.optimizers.Optimizer.__subclasses__()
-        if subclass.__module__ == keras.optimizers.Optimizer.__module__
+        if subclass.__module__ in optimizer_modules
     }
 
     if custom_optimizers is not None:

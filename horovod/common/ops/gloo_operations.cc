@@ -18,6 +18,7 @@
 #include "gloo/allgather.h"
 #include "gloo/allgatherv.h"
 #include "gloo/allreduce.h"
+#include "gloo/alltoallv.h"
 #include "gloo/broadcast.h"
 #include "gloo/math.h"
 #include "gloo/types.h"
@@ -96,6 +97,17 @@ void GlooAlgorithms<T>::Broadcast(void* buffer_data, int num_elements,
   gloo::broadcast(opts);
 }
 
+template <typename T>
+void GlooAlgorithms<T>::Alltoall(void* buffer_data, void* buffer_out,
+                                 std::vector<int64_t>& sendcounts,
+                                 std::vector<int64_t>& recvcounts) {
+  gloo::AlltoallvOptions opts(gloo_context_->ctx);
+  opts.setInput<T>(static_cast<T*>(buffer_data), sendcounts);
+  opts.setOutput<T>(static_cast<T*>(buffer_out), recvcounts);
+
+  gloo::alltoallv(opts);
+}
+
 template <typename T> int GlooAlgorithms<T>::ElementSize() const {
   return sizeof(T);
 }
@@ -108,6 +120,7 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
                               const Response& response) {
   auto& first_entry = entries[0];
 
+  const void* fused_input_data;
   void* buffer_data;
   int num_elements = (int)NumElements(entries);
 
@@ -115,7 +128,6 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
   auto& timeline = global_state_->timeline;
   if (entries.size() > 1) {
     timeline.ActivityStartAll(entries, MEMCPY_IN_FUSION_BUFFER);
-    const void* fused_input_data;
     size_t buffer_len;
     MemcpyInFusionBuffer(entries, fused_input_data, buffer_data, buffer_len);
     timeline.ActivityEndAll(entries);
@@ -123,6 +135,12 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
     buffer_data = (void*)first_entry.output->data();
     std::memcpy(buffer_data, first_entry.tensor->data(),
                 (size_t)first_entry.tensor->size());
+    fused_input_data = buffer_data;
+  }
+
+  if (response.prescale_factor() != 1.0) {
+    // Execute prescaling op
+    ScaleBuffer(response.prescale_factor(), entries, fused_input_data, buffer_data, num_elements);
   }
 
   // Do allreduce.
@@ -131,6 +149,11 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
       GetAlgorithmsForType(first_entry.tensor->dtype(), gloo_context_));
   gloo_algos->Allreduce(buffer_data, num_elements);
   timeline.ActivityEndAll(entries);
+
+  if (response.postscale_factor() != 1.0) {
+    // Execute postscaling op
+    ScaleBuffer(response.postscale_factor(), entries, buffer_data, buffer_data, num_elements);
+  }
 
   // Copy memory out of the fusion buffer.
   if (entries.size() > 1) {
@@ -184,6 +207,15 @@ Status GlooAllgather::Execute(std::vector<TensorTableEntry>& entries,
   Status status =
       AllocateOutput(entries, response, entry_component_sizes, recvcounts);
   if (!status.ok()) {
+    /* Cleanup */
+    for (size_t ec = 0; ec < entries.size(); ++ec) {
+      delete[] entry_component_sizes[ec];
+      delete[] entry_component_offsets[ec];
+    }   
+    delete[] entry_component_sizes;
+    delete[] entry_component_offsets;
+    delete[] recvcounts;
+    delete[] displcmnts;
     return status;
   }
   timeline.ActivityEndAll(entries);
@@ -272,6 +304,39 @@ Status GlooBroadcast::Execute(std::vector<TensorTableEntry>& entries,
 bool GlooBroadcast::Enabled(const ParameterManager& param_manager,
                             const std::vector<TensorTableEntry>& entries,
                             const Response& response) const {
+  return true;
+}
+
+GlooAlltoall::GlooAlltoall(GlooContext* gloo_context,
+                           HorovodGlobalState* global_state)
+    : AlltoallOp(global_state), gloo_context_(gloo_context) {}
+
+Status GlooAlltoall::Execute(std::vector<TensorTableEntry>& entries, const Response& response) {
+  assert(entries.size() == 1);
+  auto e = entries[0];
+
+  std::vector<int64_t> sdispls, rdispls;
+  std::vector<int64_t> sendcounts, recvcounts;
+  Status status = PrepareOutputAndParams(e, sdispls, rdispls, sendcounts, recvcounts);
+  if (!status.ok()) {
+    return status;
+  }
+
+  global_state_->timeline.ActivityStartAll(entries, MPI_ALLTOALL);
+
+  std::unique_ptr<IGlooAlgorithms> gloo_algos(
+      GetAlgorithmsForType(e.tensor->dtype(), gloo_context_));
+  gloo_algos->Alltoall((void*)e.tensor->data(), (void*)e.output->data(),
+                       sendcounts, recvcounts);
+
+  global_state_->timeline.ActivityEndAll(entries);
+
+  return Status::OK();
+}
+
+bool GlooAlltoall::Enabled(const ParameterManager& param_manager,
+                           const std::vector<TensorTableEntry>& entries,
+                           const Response& response) const {
   return true;
 }
 

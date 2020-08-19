@@ -13,8 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import json
 import warnings
 
@@ -46,8 +44,7 @@ def save_bare_keras_optimizer(optimizer, h5py_file):
         if type(obj).__module__ == np.__name__:
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
-            else:
-                return obj.item()
+            return obj.item()
 
         # misc functions (e.g. loss function)
         if callable(obj):

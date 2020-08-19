@@ -13,11 +13,10 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-
 import horovod.spark.common._namedtuple_fix
 
 import contextlib
+import os
 
 import pyarrow as pa
 import numpy as np
@@ -25,11 +24,39 @@ import pyspark.sql.functions as f
 from pyspark.ml.linalg import DenseVector, SparseVector, Vector, VectorUDT
 from pyspark.sql.types import ArrayType, BinaryType, BooleanType, FloatType, DoubleType, \
     IntegerType, LongType, NullType, StringType
-from pyspark.sql.types import from_arrow_type
+try:
+    # Spark 3.0 moved to a pandas submodule
+    from pyspark.sql.pandas.types import from_arrow_type
+except ImportError:
+    from pyspark.sql.types import from_arrow_type
 
+from horovod.runner.common.util import codec, host_hash as hh
 from horovod.spark.common import cache, constants
 
 _training_cache = cache.TrainingDataCache()
+
+
+def host_hash(salt=None):
+    """
+    Computes this host's host hash by invoking horovod.runner.common.util.host_hash.host_hash.
+
+    Consider environment variable CONTAINER_ID which is present when running Spark via YARN.
+    A YARN container does not share memory with other containers on the same host,
+    so it must be considered a `host` in the sense of the `host_hash`.
+
+    :param salt: extra information to include in the hash, ignores Falsy values
+    :return: host hash
+    """
+    # turn salt into an array of a single string if given
+    salt = [str(salt)] if salt else []
+
+    # We would violate resource allocation if we run all tasks of a host in one container.
+    # See [issues 1497](https://github.com/horovod/horovod/issues/1497) for details.
+    container = os.environ.get("CONTAINER_ID")
+    if container is not None:
+        salt.append(container)
+
+    return hh.host_hash(salt='-'.join(salt))
 
 
 def data_type_to_str(dtype):
@@ -121,7 +148,7 @@ def data_type_to_numpy(dtype):
 
 
 def check_shape_compatibility(metadata, feature_columns, label_columns,
-                              input_shapes=None, output_shapes=None):
+                              input_shapes=None, output_shapes=None, label_shapes=None):
     # Check for model and input type incompatibility. Columns must have the same size
     # (total number of elements) of the corresponding inputs.
     feature_count = len(feature_columns)
@@ -144,24 +171,36 @@ def check_shape_compatibility(metadata, feature_columns, label_columns,
                     'model input at index {idx} with size {input}'
                     .format(col=col, feature=col_size, idx=idx, input=input_size))
 
-    if output_shapes is not None:
-        label_count = len(label_columns)
-        if label_count != len(output_shapes):
-            raise ValueError('Label column count {labels} must equal '
-                             'model outputs count {outputs}'
-                             .format(labels=label_count, outputs=len(output_shapes)))
+    label_count = len(label_columns)
+    if label_shapes is not None and label_count != len(label_shapes):
+        raise ValueError('Label column count {labels} must equal '
+                         'provided label shapes count {outputs}'
+                         .format(labels=label_count, outputs=len(label_shapes)))
 
-        for idx, col, output_shape in zip(range(label_count), label_columns, output_shapes):
+    if output_shapes is not None and label_count != len(output_shapes):
+        raise ValueError('Label column count {labels} must equal '
+                         'model outputs count {outputs}'
+                         .format(labels=label_count, outputs=len(output_shapes)))
+
+    def _check_label_cols_size(target_shapes, target_name):
+        for idx, col, target_shape in zip(range(label_count), label_columns, target_shapes):
             col_size = metadata[col]['shape']
             if col_size is None:
                 # When training directly on Parquet, we do not compute shape metadata
                 continue
 
-            output_size = abs(np.prod(output_shape))
-            if col_size != output_size:
+            target_size = abs(np.prod(target_shape))
+            if col_size != target_size:
                 raise ValueError('Label column \'{col}\' with size {label} must equal that of the '
-                                 'model output at index {idx} with size {output}'
-                                 .format(col=col, label=col_size, idx=idx, output=output_size))
+                                 '{target_name} shape at index {idx} with size {output}'
+                                 .format(col=col, label=col_size, idx=idx, output=target_size,
+                                         target_name=target_name))
+
+    if label_shapes is not None:
+        _check_label_cols_size(label_shapes, 'label')
+    elif output_shapes is not None:
+        # Check the label size against the model output shapes only if label_shapes is not provided.
+        _check_label_cols_size(output_shapes, 'model output')
 
 
 def _get_col_info(df):
@@ -188,11 +227,6 @@ def _get_col_info(df):
                 size = data_col.indices.shape[0]
             elif isinstance(data_col, list):
                 shape = size = len(data_col)
-            elif isinstance(data_col, type(None)):
-                # Python 2.7 compat: NoneType is not pickleable
-                # see: https://bugs.python.org/issue6477
-                dtype = NullType
-                shape = size = 1
             else:
                 shape = size = 1
             row_schema.append((col_name, ({dtype}, {shape}, {size})))
@@ -384,39 +418,94 @@ def _get_dataset_info(dataset, dataset_id, path):
     return total_rows, total_byte_size
 
 
-def get_simple_meta_from_parquet(store, label_columns, feature_columns, sample_weight_col, dataset_idx=None):
+def _save_meta_to_fs(fs, path, schema, rows, total_byte_size):
+    with fs.open(path, 'wb') as train_meta_file:
+        serialized_content = codec.dumps_base64(dict(schema=schema,
+                                                     rows=rows,
+                                                     total_byte_size=total_byte_size))
+        train_meta_file.write(serialized_content.encode('utf-8'))
+
+
+def _load_metadata_from_fs(fs, path):
+    with fs.open(path, 'rb') as train_meta_file:
+        meta = train_meta_file.read()
+        meta = codec.loads_base64(meta.decode())
+        data_schema = meta['schema']
+        rows = meta['rows']
+        total_byte_size = meta['total_byte_size']
+
+    return data_schema, rows, total_byte_size
+
+
+def get_simple_meta_from_parquet(store, label_columns, feature_columns, sample_weight_col,
+                                 dataset_idx=None):
     train_data_path = store.get_train_data_path(dataset_idx)
     validation_data_path = store.get_val_data_path(dataset_idx)
 
     if not store.exists(train_data_path):
         raise ValueError("{} path does not exist in the store".format(train_data_path))
 
-    train_data = store.get_parquet_dataset(train_data_path)
-    schema = train_data.schema.to_arrow_schema()
-    train_rows, total_byte_size = _get_dataset_info(train_data, 'training', train_data_path)
-
-    val_rows = 0
-    if store.exists(validation_data_path):
-        val_data = store.get_parquet_dataset(validation_data_path)
-        val_rows, _ = _get_dataset_info(val_data, 'validation', validation_data_path)
+    train_data_meta_path = store.get_data_metadata_path(train_data_path)
+    val_data_meta_path = store.get_data_metadata_path(validation_data_path)
+    fs = store.get_filesystem()
 
     schema_cols = feature_columns + label_columns
     if sample_weight_col:
         schema_cols.append(sample_weight_col)
 
-    metadata = {}
-    for col in schema_cols:
-        col_schema = schema.field_by_name(col)
-        col_info = {
-            'spark_data_type': pyarrow_to_spark_data_type(col_schema.type),
-            'is_sparse_vector_only': False,
-            'shape': None,  # Only used by SparseVector columns
-            'intermediate_format': constants.NOCHANGE,
-            'max_size': None  # Only used by SparseVector columns
-        }
-        metadata[col] = col_info
+    def make_metadata_dictionary(_train_data_schema):
+        _metadata = {}
+        for col in schema_cols:
+            col_schema = _train_data_schema.field_by_name(col)
+            col_info = {
+                'spark_data_type': pyarrow_to_spark_data_type(col_schema.type),
+                'is_sparse_vector_only': False,
+                'shape': None,  # Only used by SparseVector columns
+                'intermediate_format': constants.NOCHANGE,
+                'max_size': None  # Only used by SparseVector columns
+            }
+            _metadata[col] = col_info
 
-    avg_row_size = total_byte_size / train_rows
+        _avg_row_size = train_data_total_byte_size / train_rows
+        return _metadata, _avg_row_size
+
+    # In the try block we try to read the data metadata from the cached metadata in the store. If
+    # anything goes wrong, we will ignore the cache and create the metadata from data.
+    try:
+        if store.exists(train_data_meta_path):
+            train_data_schema, train_rows, train_data_total_byte_size = \
+                _load_metadata_from_fs(fs, train_data_meta_path)
+            metadata, avg_row_size = make_metadata_dictionary(train_data_schema)
+
+            val_rows = 0
+            if store.exists(validation_data_path) and store.exists(val_data_meta_path):
+                val_data_schema, val_rows, val_data_total_byte_size = _load_metadata_from_fs(fs,
+                                                                                             val_data_meta_path)
+
+            return train_rows, val_rows, metadata, avg_row_size
+    except Exception as ex:
+        print(ex)
+
+    train_data = store.get_parquet_dataset(train_data_path)
+    train_data_schema = train_data.schema.to_arrow_schema()
+    train_rows, train_data_total_byte_size = _get_dataset_info(train_data, 'training',
+                                                               train_data_path)
+
+    # Write train metadata to filesystem
+    _save_meta_to_fs(fs, train_data_meta_path, train_data_schema, train_rows,
+                     train_data_total_byte_size)
+
+    val_rows = 0
+    if store.exists(validation_data_path):
+        val_data = store.get_parquet_dataset(validation_data_path)
+        val_data_schema = val_data.schema.to_arrow_schema()
+        val_rows, val_data_total_byte_size = _get_dataset_info(val_data, 'validation',
+                                                               validation_data_path)
+
+        # Write validation metadata to filesystem
+        _save_meta_to_fs(fs, val_data_meta_path, val_data_schema, val_rows,
+                         val_data_total_byte_size)
+    metadata, avg_row_size = make_metadata_dictionary(train_data_schema)
     return train_rows, val_rows, metadata, avg_row_size
 
 

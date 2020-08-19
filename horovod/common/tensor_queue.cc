@@ -30,7 +30,7 @@ Status TensorQueue::AddToTensorQueue(TensorTableEntry& e, Request& message) {
     return DUPLICATE_NAME_ERROR;
   }
   tensor_table_.emplace(e.tensor_name, std::move(e));
-  message_queue_.push(message);
+  message_queue_.push(std::move(message));
   return Status::OK();
 }
 
@@ -82,6 +82,7 @@ void TensorQueue::GetTensorEntriesFromResponse(
       assert(response.response_type() == Response::ALLREDUCE ||
              response.response_type() == Response::ALLGATHER ||
              response.response_type() == Response::BROADCAST ||
+             response.response_type() == Response::ALLTOALL ||
              response.response_type() == Response::ADASUM ||
              response.response_type() == Response::ERROR);
 
@@ -131,9 +132,9 @@ void TensorQueue::PopMessagesFromQueue(
     std::deque<Request>& message_queue_buffer) {
   std::lock_guard<std::mutex> guard(mutex_);
   while (!message_queue_.empty()) {
-    Request message = message_queue_.front();
-    message_queue_.pop();
+    Request& message = message_queue_.front();
     message_queue_buffer.push_back(std::move(message));
+    message_queue_.pop();
   }
 }
 
@@ -141,6 +142,17 @@ void TensorQueue::PopMessagesFromQueue(
 void TensorQueue::PushMessageToQueue(Request& message) {
   std::lock_guard<std::mutex> guard(mutex_);
   message_queue_.push(std::move(message));
+}
+
+// Push messages to message queue
+void TensorQueue::PushMessagesToQueue(
+    std::deque<Request>& messages) {
+  std::lock_guard<std::mutex> guard(mutex_);
+  while (!messages.empty()) {
+    Request& message = messages.front();
+    message_queue_.push(std::move(message));
+    messages.pop_front();
+  }
 }
 
 // Remove JoinOp tensor from the table and execute the callback
